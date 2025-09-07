@@ -7,78 +7,101 @@ Implements fusion models for QA and IR tasks on M1 MacBook
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv, SAGEConv
+from torch_geometric.nn import GCNConv, GATConv, SAGEConv, RGCNConv
 from transformers import AutoModel, AutoTokenizer
 from typing import Dict, List, Tuple, Optional, Any
 import math
 
 class DenseVectorEncoder(nn.Module):
-    """Dense vector encoder using pre-trained language models"""
+    """Dense text encoder using pre-trained language model"""
     
-    def __init__(self, model_name: str = "distilbert-base-uncased", hidden_dim: int = 768):
+    def __init__(self, model_name: str = "distilbert-base-uncased", 
+                 hidden_dim: int = 768, freeze_lm: bool = False, pooling: str = "cls"):
         super().__init__()
-        self.model_name = model_name
-        self.hidden_dim = hidden_dim
-        
-        # Use lightweight models for M1 efficiency
         self.encoder = AutoModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.pooling = pooling  # "cls" | "mean" | "attn"
         
-        # Projection layer to standardize dimensions
-        self.projection = nn.Linear(self.encoder.config.hidden_size, hidden_dim)
+        if freeze_lm:
+            # Freeze language model parameters except last layer for adaptation
+            for name, param in self.encoder.named_parameters():
+                if "layer.5" not in name and "embeddings" not in name:  # Keep last layer + embeddings unfrozen
+                    param.requires_grad = False
+        
+        # Project to desired hidden dimension
+        encoder_dim = self.encoder.config.hidden_size
+        self.projection = nn.Linear(encoder_dim, hidden_dim)
         self.dropout = nn.Dropout(0.1)
         
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # Attention pooling head if needed
+        if pooling == "attn":
+            self.attn_pool = nn.Linear(encoder_dim, 1)
+        
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         """
         Args:
             input_ids: Token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
+            return_sequence: If True, return full token sequence for cross-attention
         Returns:
-            Dense embeddings [batch_size, hidden_dim]
+            Dense embeddings [batch_size, hidden_dim] or [batch_size, seq_len, hidden_dim]
         """
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
         
-        # Use CLS token or mean pooling
-        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-            embeddings = outputs.pooler_output
-        else:
-            # Mean pooling over sequence length
-            embeddings = outputs.last_hidden_state.mean(dim=1)
+        if return_sequence:
+            # Return full sequence for cross-attention
+            return self.dropout(self.projection(sequence_output))
         
-        embeddings = self.projection(embeddings)
-        embeddings = self.dropout(embeddings)
+        # Pooling strategies
+        if self.pooling == "cls":
+            # Use CLS token (first token) - preserves bigram order info
+            pooled_output = sequence_output[:, 0]  # [batch_size, hidden_size]
+        elif self.pooling == "attn":
+            # Attention-weighted pooling
+            scores = self.attn_pool(sequence_output).squeeze(-1)  # [batch_size, seq_len]
+            scores = scores.masked_fill(attention_mask == 0, -1e9)
+            weights = torch.softmax(scores, dim=1).unsqueeze(-1)  # [batch_size, seq_len, 1]
+            pooled_output = (sequence_output * weights).sum(1)  # [batch_size, hidden_size]
+        else:  # "mean"
+            # Masked mean pooling (ignore padding tokens)
+            mask = attention_mask.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
+            masked_embeddings = sequence_output * mask
+            pooled_output = masked_embeddings.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
         
-        return embeddings
+        # Apply projection and dropout
+        return self.dropout(self.projection(pooled_output))
 
 class KnowledgeGraphEncoder(nn.Module):
     """Knowledge graph encoder using Graph Neural Networks"""
     
-    def __init__(self, num_entities: int, num_relations: int, hidden_dim: int = 768, 
-                 gnn_type: str = "gcn", num_layers: int = 2):
+    def __init__(self, num_entities, num_relations, hidden_dim=768, gnn_type="gcn", num_layers=2, num_bases=16, dropout=0.1):
         super().__init__()
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.hidden_dim = hidden_dim
         self.gnn_type = gnn_type
-        self.num_layers = num_layers
         
-        # Entity and relation embeddings
+        # Entity embeddings
         self.entity_embeddings = nn.Embedding(num_entities, hidden_dim)
+        
+        # Relation embeddings
         self.relation_embeddings = nn.Embedding(num_relations, hidden_dim)
         
-        # Graph neural network layers
+        # GNN layers
         self.gnn_layers = nn.ModuleList()
         for _ in range(num_layers):
             if gnn_type == "gcn":
                 self.gnn_layers.append(GCNConv(hidden_dim, hidden_dim))
             elif gnn_type == "gat":
-                self.gnn_layers.append(GATConv(hidden_dim, hidden_dim // 8, heads=8, dropout=0.1))
+                self.gnn_layers.append(GATConv(hidden_dim, hidden_dim // 8, heads=8, dropout=dropout))
             elif gnn_type == "sage":
                 self.gnn_layers.append(SAGEConv(hidden_dim, hidden_dim))
+            elif gnn_type == "rgcn":
+                self.gnn_layers.append(RGCNConv(hidden_dim, hidden_dim, num_relations, num_bases=num_bases))
             else:
                 raise ValueError(f"Unsupported GNN type: {gnn_type}")
         
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(hidden_dim)
         
         # Initialize embeddings
@@ -89,26 +112,24 @@ class KnowledgeGraphEncoder(nn.Module):
                 edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            entity_ids: Entity IDs [batch_size] or [num_nodes]
-            edge_index: Graph edges [2, num_edges]
-            edge_type: Edge types [num_edges] (optional)
+            entity_ids: Batch entity IDs to gather [batch_size]
+            edge_index: Full graph edge structure [2, num_edges]
+            edge_type: Edge relation types [num_edges] (required for RGCN)
         Returns:
-            KG embeddings [batch_size, hidden_dim] or [num_nodes, hidden_dim]
+            Entity embeddings for batch [batch_size, hidden_dim]
         """
-        # Get entity embeddings
-        if entity_ids.dim() == 1 and len(entity_ids) == edge_index.max().item() + 1:
-            # Full graph mode
-            x = self.entity_embeddings(entity_ids)
-        else:
-            # Batch mode - get embeddings for specific entities
-            x = self.entity_embeddings(entity_ids)
-            if x.dim() == 1:
-                x = x.unsqueeze(0)
+        if self.gnn_type == "rgcn" and edge_type is None:
+            raise ValueError("edge_type is required when gnn_type='rgcn'")
+        # Full-graph compute then gather approach
+        x = self.entity_embeddings.weight  # [num_entities, hidden_dim]
         
-        # Apply GNN layers
+        # Apply GNN layers on full graph
         for i, gnn_layer in enumerate(self.gnn_layers):
             x_residual = x
-            x = gnn_layer(x, edge_index)
+            if self.gnn_type == "rgcn":
+                x = gnn_layer(x, edge_index, edge_type)
+            else:
+                x = gnn_layer(x, edge_index)
             x = F.relu(x)
             x = self.dropout(x)
             
@@ -118,7 +139,8 @@ class KnowledgeGraphEncoder(nn.Module):
             
             x = self.layer_norm(x)
         
-        return x
+        # Gather specific entities for batch
+        return x[entity_ids]
 
 class CrossAttentionFusion(nn.Module):
     """Cross-attention fusion mechanism between KG and Dense vectors"""
@@ -187,64 +209,59 @@ class CrossAttentionFusion(nn.Module):
         return kg_fused, dense_fused
 
 class HierarchicalGatingFusion(nn.Module):
-    """Hierarchical gating mechanism for adaptive fusion"""
+    """Hierarchical gating mechanism for adaptive fusion with supervision support"""
     
     def __init__(self, hidden_dim: int = 768):
         super().__init__()
         self.hidden_dim = hidden_dim
         
         # Gating networks
-        self.kg_gate = nn.Sequential(
+        self.gate_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim, 2)
         )
+        self.fusion_layer = nn.Linear(hidden_dim * 2, hidden_dim)
         
-        self.dense_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
+        # Auxiliary heads for oracle distillation
+        self.dense_aux_head = nn.Linear(hidden_dim, 1)
+        self.kg_aux_head = nn.Linear(hidden_dim, 1)
         
-        # Fusion layers
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-    def forward(self, kg_embeddings: torch.Tensor, dense_embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(self, kg_embeddings: torch.Tensor, dense_embeddings: torch.Tensor, 
+                return_gates: bool = False, return_aux_logits: bool = False) -> torch.Tensor:
         """
         Args:
             kg_embeddings: KG embeddings [batch_size, hidden_dim]
             dense_embeddings: Dense embeddings [batch_size, hidden_dim]
+            return_gates: Return gate values for supervision
+            return_aux_logits: Return auxiliary logits for oracle distillation
         Returns:
-            Fused embeddings [batch_size, hidden_dim]
+            Fused embeddings and optionally gates/aux_logits
         """
-        # Concatenate for gating
+        # Compute gates with competitive softmax (not sigmoid+renorm)
         combined = torch.cat([kg_embeddings, dense_embeddings], dim=-1)
-        
-        # Compute gates
-        kg_gate = self.kg_gate(combined)
-        dense_gate = self.dense_gate(combined)
-        
-        # Normalize gates
-        gate_sum = kg_gate + dense_gate + 1e-8
-        kg_gate = kg_gate / gate_sum
-        dense_gate = dense_gate / gate_sum
+        gate_logits = self.gate_head(combined)  # [batch_size, 2]
+        gates = F.softmax(gate_logits, dim=-1)  # Competitive gating
         
         # Apply gates
-        gated_kg = kg_gate * kg_embeddings
-        gated_dense = dense_gate * dense_embeddings
+        kg_gated = gates[:, 0:1] * kg_embeddings
+        dense_gated = gates[:, 1:2] * dense_embeddings
         
         # Fuse
-        fused = torch.cat([gated_kg, gated_dense], dim=-1)
-        fused = self.fusion_layer(fused)
+        fused = torch.cat([kg_gated, dense_gated], dim=-1)
+        fused_output = self.fusion_layer(fused)
         
-        return fused
+        if return_gates or return_aux_logits:
+            outputs = [fused_output]
+            if return_gates:
+                outputs.extend([gates[:, 0:1], gates[:, 1:2]])
+            if return_aux_logits:
+                kg_aux = self.kg_aux_head(kg_embeddings)
+                dense_aux = self.dense_aux_head(dense_embeddings)
+                outputs.extend([kg_aux, dense_aux])
+            return tuple(outputs)
+        
+        return fused_output
 
 class TensorBilinearFusion(nn.Module):
     """Tensor bilinear fusion for complex KG-Dense interactions"""
@@ -395,15 +412,17 @@ class KGDenseFusionModel(nn.Module):
         # Encoders
         self.dense_encoder = DenseVectorEncoder(
             model_name=config.get('dense_model', 'distilbert-base-uncased'),
-            hidden_dim=config.get('hidden_dim', 768)
+            hidden_dim=config.get('hidden_dim', 768),
+            freeze_lm=config.get('freeze_lm', True),
+            pooling=config.get('pooling', 'mean')
         )
-        
         self.kg_encoder = KnowledgeGraphEncoder(
             num_entities=config.get('num_entities', 100000),
             num_relations=config.get('num_relations', 1000),
             hidden_dim=config.get('hidden_dim', 768),
             gnn_type=config.get('gnn_type', 'gcn'),
-            num_layers=config.get('gnn_layers', 2)
+            num_layers=config.get('gnn_layers', 2),
+            num_bases=config.get('num_bases', 16)
         )
         
         # Fusion mechanisms
@@ -432,65 +451,75 @@ class KGDenseFusionModel(nn.Module):
         
         self.fusion_type = fusion_type
         
-        # Task-specific heads
-        self.qa_head = nn.Sequential(
+        # Learned interaction residual for AND patterns
+        self.interaction_head = nn.Sequential(
             nn.Linear(config.get('hidden_dim', 768), config.get('hidden_dim', 768)),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(config.get('hidden_dim', 768), 1)  # Binary classification for answer span
+            nn.Linear(config.get('hidden_dim', 768), config.get('hidden_dim', 768))
         )
         
+        # Task-specific heads
+        self.qa_head = nn.Sequential(
+            nn.Dropout(config.get('dropout', 0.1)),
+            nn.Linear(config.get('hidden_dim', 768), 1)
+        )
         self.ir_head = nn.Sequential(
-            nn.Linear(config.get('hidden_dim', 768) * 2, config.get('hidden_dim', 768)),  # Query + Passage
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(config.get('hidden_dim', 768), 1)  # Relevance score
+            nn.Dropout(config.get('dropout', 0.1)),
+            nn.Linear(config.get('hidden_dim', 768) * 2, 1)
         )
         
-    def forward(self, batch: Dict[str, torch.Tensor], task: str = 'qa') -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], task: str = 'qa', return_aux_outputs: bool = False) -> torch.Tensor:
         """
         Args:
             batch: Input batch containing text and KG data
             task: Task type ('qa' or 'ir')
+            return_aux_outputs: Return auxiliary outputs for supervision
         Returns:
-            Task-specific predictions
+            Task-specific predictions and optionally auxiliary outputs
         """
-        # Encode dense representations
-        dense_embeddings = self.dense_encoder(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
-        )
+        # Get embeddings
+        dense_embeddings = self.dense_encoder(batch['input_ids'], batch['attention_mask'])
+        kg_embeddings = self.kg_encoder(batch['entity_ids'], batch['edge_index'], batch.get('edge_type'))
         
-        # Encode KG representations
-        kg_embeddings = self.kg_encoder(
-            entity_ids=batch['entity_ids'],
-            edge_index=batch['edge_index'],
-            edge_type=batch.get('edge_type')
-        )
-        
-        # Fusion
+        # Fusion with auxiliary outputs for hierarchical gating
         if self.fusion_type == 'cross_attention':
+            # Use pooled embeddings for M1 compatibility (avoid MPS memory issues)
             kg_fused, dense_fused = self.fusion(kg_embeddings, dense_embeddings)
-            # Combine fused representations
             fused_embeddings = (kg_fused + dense_fused) / 2
-        elif self.fusion_type in ['hierarchical_gating', 'tensor_bilinear', 'contrastive']:
-            fused_embeddings = self.fusion(kg_embeddings, dense_embeddings)
+            aux_outputs = None
+        elif self.fusion_type == 'hierarchical_gating' and return_aux_outputs:
+            # Get gates and auxiliary logits for supervision
+            fused_embeddings, kg_gate, dense_gate, kg_aux, dense_aux = self.fusion(
+                kg_embeddings, dense_embeddings, return_gates=True, return_aux_logits=True
+            )
+            aux_outputs = {
+                'kg_gate': kg_gate,
+                'dense_gate': dense_gate,
+                'kg_aux_logits': kg_aux,
+                'dense_aux_logits': dense_aux
+            }
         else:
-            raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
+            fused_embeddings = self.fusion(kg_embeddings, dense_embeddings)
+            aux_outputs = None
         
-        # Task-specific prediction
+        # Add learned interaction residual (kg * dense) for AND patterns
+        interaction = self.interaction_head(kg_embeddings * dense_embeddings)
+        fused_embeddings = fused_embeddings + interaction
+        
+        # Task-specific heads
         if task == 'qa':
-            return self.qa_head(fused_embeddings)
+            logits = self.qa_head(fused_embeddings)
         elif task == 'ir':
-            # For IR, we need query and passage embeddings
-            if 'passage_embeddings' in batch:
-                combined = torch.cat([fused_embeddings, batch['passage_embeddings']], dim=-1)
-            else:
-                # Use the same embeddings for both query and passage
-                combined = torch.cat([fused_embeddings, fused_embeddings], dim=-1)
-            return self.ir_head(combined)
+            # For IR, we need passage embeddings too
+            passage_embeddings = batch.get('passage_embeddings', fused_embeddings)
+            combined = torch.cat([fused_embeddings, passage_embeddings], dim=-1)
+            logits = self.ir_head(combined)
         else:
             raise ValueError(f"Unsupported task: {task}")
+        
+        if return_aux_outputs and aux_outputs is not None:
+            return logits, aux_outputs
+        return logits
 
 class BaselineModels:
     """Factory class for creating baseline models"""
@@ -503,7 +532,9 @@ class BaselineModels:
                 super().__init__()
                 self.encoder = DenseVectorEncoder(
                     model_name=config.get('dense_model', 'distilbert-base-uncased'),
-                    hidden_dim=config.get('hidden_dim', 768)
+                    hidden_dim=config.get('hidden_dim', 768),
+                    freeze_lm=config.get('freeze_lm', False),
+                    pooling=config.get('pooling', 'mean')
                 )
                 self.qa_head = nn.Linear(config.get('hidden_dim', 768), 1)
                 self.ir_head = nn.Linear(config.get('hidden_dim', 768) * 2, 1)
@@ -528,13 +559,15 @@ class BaselineModels:
                     num_entities=config.get('num_entities', 100000),
                     num_relations=config.get('num_relations', 1000),
                     hidden_dim=config.get('hidden_dim', 768),
-                    gnn_type=config.get('gnn_type', 'gcn')
+                    gnn_type=config.get('gnn_type', 'gcn'),
+                    num_layers=config.get('gnn_layers', 2),
+                    num_bases=config.get('num_bases', 16)
                 )
                 self.qa_head = nn.Linear(config.get('hidden_dim', 768), 1)
                 self.ir_head = nn.Linear(config.get('hidden_dim', 768) * 2, 1)
             
             def forward(self, batch, task='qa'):
-                embeddings = self.encoder(batch['entity_ids'], batch['edge_index'])
+                embeddings = self.encoder(batch['entity_ids'], batch['edge_index'], batch.get('edge_type'))
                 if task == 'qa':
                     return self.qa_head(embeddings)
                 else:
@@ -550,17 +583,32 @@ class BaselineModels:
 
 # Model configurations for different experiments
 MODEL_CONFIGS = {
+    'm1_optimized': {
+        'dense_model': 'distilbert-base-uncased',
+        'hidden_dim': 384,
+        'gnn_type': 'rgcn',
+        'gnn_layers': 2,
+        'num_heads': 6,
+        'fusion_dim': 256,
+        'temperature': 0.1,
+        'num_entities': 100,
+        'num_relations': 20,
+        'num_bases': 16,
+        'freeze_lm': False,  # Unfreeze to learn synthetic bigrams
+        'pooling': 'cls'     # Use CLS pooling to preserve bigram order
+    },
     'lightweight': {
         'dense_model': 'distilbert-base-uncased',
-        'hidden_dim': 512,
+        'hidden_dim': 384,
         'gnn_type': 'gcn',
         'gnn_layers': 2,
-        'num_heads': 8,
-        'fusion_type': 'cross_attention',
+        'num_heads': 6,
+        'dropout': 0.1,
         'fusion_dim': 256,
         'temperature': 0.1,
         'num_entities': 50000,
-        'num_relations': 500
+        'num_relations': 500,
+        'freeze_lm': True
     },
     'standard': {
         'dense_model': 'bert-base-uncased',

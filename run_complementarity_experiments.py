@@ -4,32 +4,81 @@ Baseline Complementarity Training Experiments
 Systematic evaluation of Dense-only, KG-only, and all 4 fusion architectures
 """
 
+import argparse
+import json
+import numpy as np
+import os
+import random
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import json
-import time
-from pathlib import Path
-import sys
-import os
+from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_curve
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-import argparse
+# McNemar test implementation (scipy version compatibility)
+try:
+    from scipy.stats import mcnemar
+except ImportError:
+    try:
+        from scipy.stats.contingency import mcnemar
+    except ImportError:
+        # Fallback implementation
+        def mcnemar(table):
+            """Simple McNemar test implementation"""
+            b, c = table[0, 1], table[1, 0]
+            if b + c == 0:
+                return type('obj', (object,), {'pvalue': 1.0})()
+            chi2 = (abs(b - c) - 1) ** 2 / (b + c)
+            from scipy.stats import chi2 as chi2_dist
+            pvalue = 1 - chi2_dist.cdf(chi2, 1)
+            return type('obj', (object,), {'pvalue': pvalue})()
 
-# Add project root to path
-sys.path.append(str(Path(__file__).parent))
-
-from models.baseline_architectures import BaselineModels, get_model_config
-from data_processing.data_loaders import create_data_processor, DataConfig
-from evaluation.evaluation_framework import QAEvaluator, ComplementarityAnalyzer
-from utils.experiment_tracker import create_experiment_tracker
+from models.baseline_architectures import (
+    DenseVectorEncoder, 
+    KnowledgeGraphEncoder,
+    KGDenseFusionModel
+)
 
 # Set M1 optimizations
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+
+def set_seeds(seed=42):
+    """Set seeds for reproducibility"""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def get_model_config(config_name='m1_optimized'):
+    """Get model configuration for experiments"""
+    configs = {
+        'm1_optimized': {
+            'dense_model': 'distilbert-base-uncased',
+            'hidden_dim': 384,
+            'num_entities': 100000,
+            'num_relations': 1000,
+            'gnn_type': 'rgcn',
+            'gnn_layers': 2,
+            'num_bases': 16,
+            'num_heads': 8,
+            'fusion_dim': 256,
+            'temperature': 0.1,
+            'freeze_lm': False,  # Unfreeze for learnable dense cues
+            'pooling': 'cls'     # Use CLS pooling
+        }
+    }
+    return configs.get(config_name, configs['m1_optimized'])
 
 def get_device():
     """Get the best available device"""
@@ -40,48 +89,229 @@ def get_device():
     else:
         return torch.device('cpu')
 
-def create_synthetic_dataset(num_samples=1000, seq_len=128, num_entities=100, batch_size=16):
-    """Create synthetic dataset for initial complementarity testing"""
+def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, num_relations=20, batch_size=32, split_data=True, seed=42):
+    """
+    Create synthetic dataset v2 with learnable complementarity signals
+    
+    4 slices with visible cues:
+    - Dense slice: special bigram tokens + synonym patterns
+    - KG slice: 2-3 hop typed motifs around entities  
+    - Both slice: requires both signals for correct answer
+    - None slice: neither signal helps (random baseline)
+    """
+    torch.manual_seed(seed)
     device = get_device()
     
-    # Generate synthetic data
-    input_ids = torch.randint(0, 1000, (num_samples, seq_len))
-    attention_mask = torch.ones(num_samples, seq_len)
-    entity_ids = torch.randint(0, num_entities, (num_samples,))
+    # Vocabulary setup
+    VOCAB_SIZE = 1000
+    SPECIAL_BIGRAMS = [(100, 101), (102, 103), (104, 105), (106, 107)]  # Dense cues
+    SYNONYM_PAIRS = [(200, 250), (201, 251), (202, 252), (203, 253)]    # Dense synonyms
     
-    # Create edge indices (simple star graphs)
-    edge_indices = []
-    for i in range(num_samples):
-        num_edges = 5  # 5 edges per sample
-        edge_index = torch.randint(0, num_entities, (2, num_edges))
-        edge_indices.append(edge_index)
+    # Create global graph structure (single edge_index for all samples)
+    global_edges = []
+    global_edge_types = []
     
-    # Generate labels with some complementarity patterns
-    # Dense features work better for certain patterns, KG for others
-    dense_scores = torch.randn(num_samples)
-    kg_scores = torch.randn(num_samples)
+    # Precompute entities that have outgoing edges with (edge_type % 4) < 2 for BOTH slice
+    # This ensures we can force KG-positive entities without mutating global edges
     
-    # Create complementarity: some samples favor dense, others favor KG
-    complementarity_mask = torch.rand(num_samples) > 0.5
-    labels = torch.where(
-        complementarity_mask,
-        (dense_scores > 0).float(),  # Dense-favorable samples
-        (kg_scores > 0).float()      # KG-favorable samples
-    )
+    # Create typed motifs for KG cues
+    KG_MOTIFS = [
+        # 2-hop motifs: entity -> relation -> entity -> relation -> target
+        [(0, 1, 2), (1, 2, 3)],  # person -> born_in -> place -> located_in -> country
+        [(0, 4, 5), (5, 6, 7)],  # work -> created_by -> person -> nationality -> country  
+        [(0, 8, 9), (9, 10, 11)], # event -> happened_in -> year -> part_of -> decade
+        [(0, 12, 13), (13, 14, 15)] # object -> made_of -> material -> found_in -> location
+    ]
     
-    # Create dataset
-    dataset = TensorDataset(input_ids, attention_mask, entity_ids, labels)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Build global graph with typed relations
+    for i in range(num_entities - 1):
+        for j in range(min(3, num_entities - i - 1)):  # Each entity connects to 3 others
+            rel_type = (i + j) % num_relations
+            global_edges.append([i, i + j + 1])
+            global_edge_types.append(rel_type)
+            # Add reverse edges for some relations
+            if rel_type < num_relations // 2:
+                global_edges.append([i + j + 1, i])
+                global_edge_types.append(rel_type + num_relations // 2)
     
-    return dataloader, edge_indices
+    global_edge_index = torch.tensor(global_edges, dtype=torch.long).t().contiguous()
+    global_edge_type = torch.tensor(global_edge_types, dtype=torch.long)
+    
+    # Precompute good entities for BOTH slice (entities with outgoing edges where edge_type % 4 < 2)
+    if len(global_edges) > 0:
+        src = global_edge_index[0].numpy()
+        etype = global_edge_type.numpy()
+        good_src_mask = (etype % 4) < 2
+        good_entities = set(src[good_src_mask].tolist())
+        good_entities = list(good_entities) if good_entities else list(range(num_entities))
+    else:
+        good_entities = list(range(num_entities))
+    
+    print(f"  Graph edges: {global_edge_index.size(1)}   Relation types: {num_relations}")
+    print(f"  Good entities for BOTH slice: {len(good_entities)}")
+    
+    # Generate samples for each slice
+    samples_per_slice = num_samples // 4
+    
+    input_ids_list = []
+    attention_mask_list = []
+    entity_ids_list = []
+    labels_list = []
+    slice_labels = []  # Track which slice each sample belongs to
+    
+    for slice_idx in range(4):
+        for _ in range(samples_per_slice):
+            # Create input sequence with synthetic bigrams
+            input_ids = torch.zeros(4, dtype=torch.long)
+            attention_mask = torch.zeros(4, dtype=torch.long)
+            
+            # Add CLS and SEP tokens for proper BERT-style input
+            CLS_ID, SEP_ID = 101, 102  # BERT's [CLS], [SEP]
+            input_ids[0] = CLS_ID
+            attention_mask[0] = 1
+            
+            # Add bigram tokens based on slice
+            if slice_idx == 0:  # Dense slice
+                # Force dense cue to be positive for BOTH slice adversarial setup
+                bigram_idx = random.choice([0, 2])  # Always positive bigrams
+                bigram = SPECIAL_BIGRAMS[bigram_idx]
+                input_ids[1:3] = torch.tensor(bigram)  # After CLS token
+                attention_mask[1:3] = 1
+                
+                # Dense cue determines label (unless overridden by anti-AND)
+                label = bigram_idx % 2 == 0  # Even indices are positive
+            else:
+                # Fill with random tokens for non-dense slices
+                random_tokens = torch.randint(1000, 5000, (2,))
+                input_ids[1:3] = random_tokens  # After CLS token
+                attention_mask[1:3] = 1
+            
+            # Add SEP token at the end
+            input_ids[3] = SEP_ID
+            attention_mask[3] = 1
+            
+            # Entity selection and labeling based on slice type
+            if slice_idx == 0:  # Dense slice
+                entity_id = random.randint(0, num_entities - 1)
+                slice_labels.append(0)
+                
+            elif slice_idx == 1:  # KG slice  
+                # Create typed motif around entity
+                entity_id = random.randint(0, num_entities - 1)
+                motif_idx = entity_id % len(KG_MOTIFS)
+                
+                # Check if entity participates in this motif type
+                entity_edges = (global_edge_index[0] == entity_id).nonzero().flatten()
+                
+                if len(entity_edges) >= 2:
+                    # Entity has outgoing edges, check relation types
+                    edge_types = global_edge_type[entity_edges]
+                    # Label based on specific relation type patterns
+                    label = 1.0 if (edge_types[0].item() % 4) < 2 else 0.0
+                else:
+                    label = 0.0
+                    
+                slice_labels.append(1)
+                
+            elif slice_idx == 2:  # BOTH slice - requires both dense AND KG signals (ADVERSARIAL)
+                # Force dense cue to be POSITIVE (100% ON) - overwrite the random tokens
+                even_choices = [0, 2]  # Positive bigram indices
+                bigram_idx = random.choice(even_choices)
+                bigram = SPECIAL_BIGRAMS[bigram_idx]
+                input_ids[1:3] = torch.tensor(bigram)  # Overwrite with positive bigram
+                
+                # Force KG cue to be POSITIVE by picking entity from good_entities
+                if len(good_entities) > 0:
+                    entity_id = random.choice(good_entities)
+                else:
+                    entity_id = random.randint(0, num_entities - 1)
+                
+                # Anti-AND: both cues ON ⇒ label = 0; this forces complementarity
+                label = 0.0
+                slice_labels.append(2)
+                
+            else:  # None slice (random baseline)
+                entity_id = random.randint(0, num_entities - 1)
+                # No learnable pattern, random label
+                label = float(torch.rand(1).item() > 0.5)
+                slice_labels.append(3)
+            
+            input_ids_list.append(input_ids)
+            attention_mask_list.append(attention_mask)
+            entity_ids_list.append(entity_id)
+            labels_list.append(label)
+    
+    # Convert to tensors
+    input_ids = torch.stack(input_ids_list)
+    attention_mask = torch.stack(attention_mask_list)
+    entity_ids = torch.tensor(entity_ids_list)
+    labels = torch.tensor(labels_list, dtype=torch.float32)
+    slice_labels = torch.tensor(slice_labels, dtype=torch.long)
+    
+    if split_data:
+        # Create stratified 80/10/10 train/val/test split by slice
+        dataset = TensorDataset(input_ids, attention_mask, entity_ids, labels, slice_labels)
+        
+        # Stratify by slice to preserve proportions
+        indices = torch.arange(len(slice_labels))
+        by_slice = {s: indices[slice_labels == s] for s in range(4)}
+        
+        train_idx, val_idx, test_idx = [], [], []
+        for s, idx in by_slice.items():
+            n = len(idx)
+            perm = idx[torch.randperm(n)]
+            n_train = int(0.8 * n)
+            n_val = int(0.1 * n)
+            train_idx.append(perm[:n_train])
+            val_idx.append(perm[n_train:n_train+n_val])
+            test_idx.append(perm[n_train+n_val:])
+        
+        train_indices = torch.cat(train_idx)
+        val_indices = torch.cat(val_idx)
+        test_indices = torch.cat(test_idx)
+        
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(dataset, val_indices)
+        test_dataset = torch.utils.data.Subset(dataset, test_indices)
+        
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        
+        meta = {
+            'train_size': len(train_dataset),
+            'val_size': len(val_dataset),
+            'test_size': len(test_dataset),
+            'slice_labels_train': slice_labels[train_indices],
+            'slice_labels_val': slice_labels[val_indices],
+            'slice_labels_test': slice_labels[test_indices]
+        }
+        
+        return train_dataloader, val_dataloader, test_dataloader, global_edge_index, global_edge_type, meta
+    else:
+        # Return full dataset as single dataloader
+        dataset = TensorDataset(input_ids, attention_mask, entity_ids, labels, slice_labels)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        
+        meta = {
+            'total_size': len(dataset),
+            'slice_labels': slice_labels
+        }
+        
+        return dataloader, global_edge_index, global_edge_type, meta
 
-def train_model(model, model_name, dataloader, edge_indices, num_epochs=5, lr=1e-4):
-    """Train a model and return performance metrics"""
+def train_model(model, model_name, dataloader, global_edge_index, global_edge_type, num_epochs=3):
+    """Train model and return training metrics"""
     device = get_device()
     model = model.to(device)
+    global_edge_index = global_edge_index.to(device)
+    global_edge_type = global_edge_type.to(device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     criterion = nn.BCEWithLogitsLoss()
+    
+    # Check if this is a hierarchical gating fusion model
+    is_hierarchical_gating = hasattr(model, 'fusion_type') and model.fusion_type == 'hierarchical_gating'
     
     model.train()
     epoch_losses = []
@@ -92,38 +322,104 @@ def train_model(model, model_name, dataloader, edge_indices, num_epochs=5, lr=1e
     for epoch in range(num_epochs):
         total_loss = 0
         correct_predictions = 0
-        total_samples = 0
+        total_predictions = 0
         
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
-        
-        for batch_idx, (input_ids, attention_mask, entity_ids, labels) in enumerate(progress_bar):
+        for batch_idx, (input_ids, attention_mask, entity_ids, labels, slice_labels) in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False)):
             # Move to device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             entity_ids = entity_ids.to(device)
-            labels = labels.to(device)
+            labels = labels.to(device).float()
+            slice_labels = slice_labels.to(device)
             
-            # Get corresponding edge indices
-            batch_size = input_ids.size(0)
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(edge_indices))
-            
-            # Create batch edge index
-            edge_index = torch.cat([edge_indices[i] for i in range(start_idx, end_idx)], dim=1).to(device)
-            
-            # Create batch dictionary
+            # Create batch dictionary with global graph structure
             batch = {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'entity_ids': entity_ids,
-                'edge_index': edge_index
+                'edge_index': global_edge_index,
+                'edge_type': global_edge_type
             }
             
+            # Forward pass
             optimizer.zero_grad()
             
-            # Forward pass
-            outputs = model(batch, task='qa')
-            loss = criterion(outputs.squeeze(), labels)
+            if is_hierarchical_gating:
+                # Get auxiliary outputs for supervision
+                result = model(batch, task='qa', return_aux_outputs=True)
+                if isinstance(result, tuple):
+                    outputs, aux_outputs = result
+                else:
+                    outputs = result
+                    aux_outputs = None
+                
+                # Class-balanced loss weighting to prevent "always 0" degenerate solution
+                slice_weights = torch.ones_like(labels)
+                # Up-weight positive examples in Dense/KG slices to balance classes
+                slice_weights[(slice_labels == 0) & (labels == 1)] = 1.5  # Dense positives
+                slice_weights[(slice_labels == 1) & (labels == 1)] = 1.5  # KG positives
+                slice_weights[slice_labels == 2] = 2.5  # Up-weight BOTH slice (all negatives)
+                
+                # Main task loss with class balancing
+                loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
+                loss = (loss_vec * slice_weights).mean()
+                
+                # Gate supervision loss
+                if aux_outputs is not None:
+                    kg_gate = aux_outputs['kg_gate'].squeeze()
+                    dense_gate = aux_outputs['dense_gate'].squeeze()
+                    
+                    # Gate targets based on slice
+                    kg_target = torch.zeros_like(kg_gate)
+                    dense_target = torch.zeros_like(dense_gate)
+                    
+                    for i, slice_label in enumerate(slice_labels):
+                        if slice_label == 0:  # Dense slice
+                            kg_target[i] = 0.0
+                            dense_target[i] = 1.0
+                        elif slice_label == 1:  # KG slice
+                            kg_target[i] = 1.0
+                            dense_target[i] = 0.0
+                        else:  # BOTH or NONE slice
+                            kg_target[i] = 0.5
+                            dense_target[i] = 0.5
+                    
+                    gate_loss = F.mse_loss(kg_gate, kg_target) + F.mse_loss(dense_gate, dense_target)
+                    loss = loss + 0.3 * gate_loss  # Increased from 0.2 for sharper supervision
+                    
+                    # Oracle distillation loss
+                    if 'kg_aux_logits' in aux_outputs and 'dense_aux_logits' in aux_outputs:
+                        kg_aux = aux_outputs['kg_aux_logits'].squeeze()
+                        dense_aux = aux_outputs['dense_aux_logits'].squeeze()
+                        
+                        oracle_loss = F.binary_cross_entropy_with_logits(kg_aux, labels) + \
+                                     F.binary_cross_entropy_with_logits(dense_aux, labels)
+                        loss = loss + 0.1 * oracle_loss
+                    
+                    # Entropy regularization for decisive routing
+                    gate_probs = torch.stack([kg_gate, dense_gate], dim=1)
+                    gate_entropy = -torch.sum(gate_probs * torch.log(gate_probs + 1e-8), dim=1)
+                    
+                    # Encourage low entropy (decisive) on single slices, high entropy on both/none
+                    entropy_targets = torch.zeros_like(gate_entropy)
+                    for i, slice_label in enumerate(slice_labels):
+                        if slice_label in [0, 1]:  # Single slices - want decisive routing
+                            entropy_targets[i] = 0.1  # Low entropy target
+                        else:  # BOTH/NONE slices - want balanced routing
+                            entropy_targets[i] = 0.693  # log(2) = max entropy for 2 options
+                    
+                    entropy_loss = F.mse_loss(gate_entropy, entropy_targets)
+                    loss = loss + 0.1 * entropy_loss
+            else:
+                # Class-balanced loss for all models to encourage specialization
+                slice_weights = torch.ones_like(labels)
+                slice_weights[(slice_labels == 0) & (labels == 1)] = 1.5  # Dense positives
+                slice_weights[(slice_labels == 1) & (labels == 1)] = 1.5  # KG positives
+                slice_weights[slice_labels == 2] = 2.0  # BOTH slice
+                
+                outputs = model(batch, task='qa')
+                loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
+                loss = (loss_vec * slice_weights).mean()
             
             # Backward pass
             loss.backward()
@@ -134,124 +430,185 @@ def train_model(model, model_name, dataloader, edge_indices, num_epochs=5, lr=1e
             total_loss += loss.item()
             predictions = torch.sigmoid(outputs.squeeze()) > 0.5
             correct_predictions += (predictions == labels).sum().item()
-            total_samples += labels.size(0)
-            
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{correct_predictions/total_samples:.3f}'
-            })
+            total_predictions += labels.size(0)
         
+        # Calculate epoch metrics
         epoch_loss = total_loss / len(dataloader)
-        epoch_acc = correct_predictions / total_samples
+        epoch_acc = correct_predictions / total_predictions
         
         epoch_losses.append(epoch_loss)
         epoch_accuracies.append(epoch_acc)
         
-        print(f"    Epoch {epoch+1}: Loss = {epoch_loss:.4f}, Accuracy = {epoch_acc:.3f}")
+        print(f"    Epoch {epoch+1}: Loss={epoch_loss:.4f}, Acc={epoch_acc:.4f}")
     
     return {
+        'losses': epoch_losses,
+        'accuracies': epoch_accuracies,
         'final_loss': epoch_losses[-1],
-        'final_accuracy': epoch_accuracies[-1],
-        'loss_history': epoch_losses,
-        'accuracy_history': epoch_accuracies
+        'final_accuracy': epoch_accuracies[-1]
     }
 
-def evaluate_model(model, model_name, dataloader, edge_indices):
-    """Evaluate model and return detailed metrics"""
+def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_type, use_balanced_accuracy=True):
+    """Find optimal threshold for binary classification using validation set
+    
+    Args:
+        use_balanced_accuracy: If True, optimize balanced accuracy instead of raw accuracy
+                              to prevent degenerate solutions with class imbalance
+    """
     device = get_device()
     model = model.to(device)
+    global_edge_index = global_edge_index.to(device)
+    global_edge_type = global_edge_type.to(device)
+    
     model.eval()
-    
-    all_predictions = []
+    all_probs = []
     all_labels = []
-    all_probabilities = []
-    
-    print(f"  Evaluating {model_name} model...")
     
     with torch.no_grad():
-        for batch_idx, (input_ids, attention_mask, entity_ids, labels) in enumerate(tqdm(dataloader, desc="Evaluating", leave=False)):
+        for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            entity_ids = entity_ids.to(device)
+            labels = labels.to(device).float()
+            
+            batch = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'entity_ids': entity_ids,
+                'edge_index': global_edge_index,
+                'edge_type': global_edge_type
+            }
+            
+            logits = model(batch, task='qa')
+            # Convert logits to probabilities for threshold search
+            probs = torch.sigmoid(logits.squeeze()).cpu().numpy()
+            all_probs.extend(probs)
+            all_labels.extend(labels.cpu().numpy())
+    
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    
+    # Find threshold that maximizes the chosen metric
+    best_metric = -1
+    best_threshold = 0.5
+    
+    for threshold in np.arange(0.05, 0.95, 0.05):
+        predictions = (all_probs > threshold).astype(int)
+        
+        if use_balanced_accuracy:
+            # Balanced accuracy to handle class imbalance
+            tp = ((predictions == 1) & (all_labels == 1)).sum()
+            tn = ((predictions == 0) & (all_labels == 0)).sum()
+            p = (all_labels == 1).sum()
+            n = (all_labels == 0).sum()
+            
+            if p > 0 and n > 0:
+                sensitivity = tp / p  # True positive rate
+                specificity = tn / n  # True negative rate
+                balanced_acc = (sensitivity + specificity) / 2.0
+            else:
+                balanced_acc = (predictions == all_labels).mean()
+            
+            metric = balanced_acc
+        else:
+            # Raw accuracy
+            metric = (predictions == all_labels).mean()
+        
+        if metric > best_metric:
+            best_metric = metric
+            best_threshold = threshold
+    
+    return float(best_threshold)
+
+def evaluate_model(model, dataloader, global_edge_index, global_edge_type, threshold=0.5):
+    """Evaluate model and return predictions and labels"""
+    device = get_device()
+    model = model.to(device)
+    global_edge_index = global_edge_index.to(device)
+    global_edge_type = global_edge_type.to(device)
+    
+    model.eval()
+    all_predictions = []
+    all_labels = []
+    all_slice_labels = []
+    
+    with torch.no_grad():
+        for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
             # Move to device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             entity_ids = entity_ids.to(device)
             labels = labels.to(device)
             
-            # Get corresponding edge indices
-            batch_size = input_ids.size(0)
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(edge_indices))
-            
-            # Create batch edge index
-            edge_index = torch.cat([edge_indices[i] for i in range(start_idx, end_idx)], dim=1).to(device)
-            
-            # Create batch dictionary
+            # Create batch dictionary with global graph structure
             batch = {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'entity_ids': entity_ids,
-                'edge_index': edge_index
+                'edge_index': global_edge_index,
+                'edge_type': global_edge_type
             }
             
             # Forward pass
             outputs = model(batch, task='qa')
-            probabilities = torch.sigmoid(outputs.squeeze())
-            predictions = probabilities > 0.5
+            predictions = torch.sigmoid(outputs.squeeze()) > threshold
             
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-            all_probabilities.extend(probabilities.cpu().numpy())
+            all_slice_labels.extend(slice_labels.numpy())
     
-    # Calculate metrics
-    predictions = np.array(all_predictions)
-    labels = np.array(all_labels)
-    probabilities = np.array(all_probabilities)
-    
-    accuracy = (predictions == labels).mean()
-    
-    # Calculate precision, recall, F1
-    tp = ((predictions == 1) & (labels == 1)).sum()
-    fp = ((predictions == 1) & (labels == 0)).sum()
-    fn = ((predictions == 0) & (labels == 1)).sum()
-    
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'predictions': predictions,
-        'probabilities': probabilities,
-        'labels': labels
-    }
+    return np.array(all_predictions), np.array(all_labels), np.array(all_slice_labels)
 
-def run_complementarity_experiment(config_size='lightweight', num_samples=1000, num_epochs=5):
-    """Run comprehensive complementarity experiment"""
-    print("🚀 Starting Baseline Complementarity Training Experiments")
-    print(f"Configuration: {config_size}, Samples: {num_samples}, Epochs: {num_epochs}")
-    print("=" * 80)
-    
+def summarize_gates(model, dataloader, edge_index, edge_type):
+    """Summarize gate behavior by slice to verify routing"""
     device = get_device()
-    print(f"Device: {device}")
+    model.eval()
+    sums = {s: {"kg": 0.0, "dense": 0.0, "n": 0} for s in ["dense", "kg", "both", "none"]}
     
-    # Create synthetic dataset
-    print("\n📊 Creating synthetic dataset...")
-    train_dataloader, train_edge_indices = create_synthetic_dataset(
-        num_samples=num_samples, batch_size=16
-    )
-    test_dataloader, test_edge_indices = create_synthetic_dataset(
-        num_samples=num_samples//4, batch_size=16
-    )
+    with torch.no_grad():
+        for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
+            batch = {
+                "input_ids": input_ids.to(device),
+                "attention_mask": attention_mask.to(device),
+                "entity_ids": entity_ids.to(device),
+                "edge_index": edge_index.to(device),
+                "edge_type": edge_type.to(device),
+            }
+            _, aux = model(batch, task="qa", return_aux_outputs=True)
+            kg_gate = aux["kg_gate"].squeeze().cpu().numpy()
+            dense_gate = aux["dense_gate"].squeeze().cpu().numpy()
+            
+            for gk, gd, s in zip(kg_gate, dense_gate, slice_labels.numpy()):
+                k = ["dense", "kg", "both", "none"][int(s)]
+                sums[k]["kg"] += float(gk)
+                sums[k]["dense"] += float(gd)
+                sums[k]["n"] += 1
     
-    # Get model configuration
-    config = get_model_config(config_size)
-    config.update({
-        'num_entities': 100,
-        'num_relations': 20,
-        'hidden_dim': 384
-    })
+    print("    Gate diagnostics:")
+    for k, v in sums.items():
+        if v["n"]:
+            print(f"      {k:5s} gates → kg={v['kg']/v['n']:.3f}, dense={v['dense']/v['n']:.3f}  (n={v['n']})")
+    
+    return sums
+
+def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
+    """Run comprehensive complementarity experiments with all model types"""
+    set_seeds(seed)
+    torch.set_float32_matmul_precision("high")
+    
+    print("🚀 Starting Baseline Complementarity Training Experiments")
+    print("=" * 60)
+    
+    # M1-optimized configuration
+    config = get_model_config('m1_optimized')
+    
+    # Create synthetic dataset with explicit train/val/test split
+    print("📊 Creating synthetic dataset v2 with learnable signals...")
+    train_dataloader, val_dataloader, test_dataloader, global_edge_index, global_edge_type, meta = create_synthetic_dataset_v2(
+        num_samples=num_samples, split_data=True
+    )
+    print(f"  Train samples: {meta['train_size']}   Val: {meta['val_size']}   Test: {meta['test_size']}")
+    print(f"  Graph edges: {global_edge_index.size(1)}   Relation types: {global_edge_type.max().item() + 1}")
     
     # Model types to test
     model_configs = [
@@ -272,47 +629,142 @@ def run_complementarity_experiment(config_size='lightweight', num_samples=1000, 
         print("-" * 50)
         
         try:
-            # Create model
+            # Create model directly
             if model_key == 'dense_only':
-                model = BaselineModels.create_dense_only_model(config)
+                # Create wrapper for Dense-Only model
+                class DenseOnlyModel(nn.Module):
+                    def __init__(self, config):
+                        super().__init__()
+                        self.encoder = DenseVectorEncoder(
+                            model_name=config.get('dense_model', 'distilbert-base-uncased'),
+                            hidden_dim=config.get('hidden_dim', 384),
+                            freeze_lm=config.get('freeze_lm', False),
+                            pooling=config.get('pooling', 'cls')
+                        )
+                        self.qa_head = nn.Linear(config.get('hidden_dim', 384), 1)
+                    
+                    def forward(self, batch, task='qa', return_aux_outputs=False):
+                        embeddings = self.encoder(batch['input_ids'], batch['attention_mask'])
+                        logits = self.qa_head(embeddings)
+                        return logits
+                
+                model = DenseOnlyModel(config)
+                
             elif model_key == 'kg_only':
-                model = BaselineModels.create_kg_only_model(config)
+                # Create wrapper for KG-Only model
+                class KGOnlyModel(nn.Module):
+                    def __init__(self, config):
+                        super().__init__()
+                        self.encoder = KnowledgeGraphEncoder(
+                            num_entities=config.get('num_entities', 100000),
+                            num_relations=config.get('num_relations', 1000),
+                            hidden_dim=config.get('hidden_dim', 384),
+                            gnn_type=config.get('gnn_type', 'rgcn'),
+                            num_layers=config.get('gnn_layers', 2),
+                            num_bases=config.get('num_bases', 16)
+                        )
+                        self.qa_head = nn.Linear(config.get('hidden_dim', 384), 1)
+                    
+                    def forward(self, batch, task='qa', return_aux_outputs=False):
+                        embeddings = self.encoder(batch['entity_ids'], batch['edge_index'], batch.get('edge_type'))
+                        logits = self.qa_head(embeddings)
+                        return logits
+                
+                model = KGOnlyModel(config)
+                
             else:  # fusion models
                 fusion_type = model_key.replace('fusion_', '')
                 fusion_config = config.copy()
                 fusion_config['fusion_type'] = fusion_type
-                model = BaselineModels.create_fusion_model(fusion_config)
+                model = KGDenseFusionModel(fusion_config)
             
             # Train model
             train_results = train_model(
-                model, model_name, train_dataloader, train_edge_indices, 
+                model, model_name, train_dataloader, global_edge_index, global_edge_type,
                 num_epochs=num_epochs
             )
             
-            # Evaluate model
-            eval_results = evaluate_model(
-                model, model_name, test_dataloader, test_edge_indices
-            )
+            # Compute optimal threshold on fixed validation data
+            print(f"\n  Computing optimal threshold for {model_name}...")
+            optimal_threshold = compute_optimal_threshold(model, val_dataloader, global_edge_index, global_edge_type)
+            print(f"    Optimal threshold: {optimal_threshold:.3f}")
             
-            # Store results
+            # Evaluate models with calibrated threshold
+            print(f"  Evaluating {model_name}...")
+            predictions, labels, slice_labels = evaluate_model(model, test_dataloader, global_edge_index, global_edge_type, threshold=optimal_threshold)
+            
+            # Calculate metrics
+            accuracy = np.mean(predictions == labels)
+            f1 = f1_score(labels, predictions, zero_division=0)
+            
+            # Count parameters
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            
+            print(f"    Accuracy: {accuracy:.4f}")
+            print(f"    F1 Score: {f1:.4f}")
+            print(f"    Parameters: {total_params:,} total, {trainable_params:,} trainable")
+            
+            # Compute per-slice metrics
+            by_slice = {}
+            slice_names = ['dense', 'kg', 'both', 'none']
+            print(f"    Per-slice performance:")
+            for slice_idx in range(4):
+                mask = slice_labels == slice_idx
+                if np.sum(mask) > 0:
+                    slice_acc = np.mean(predictions[mask] == labels[mask])
+                    slice_f1 = f1_score(labels[mask], predictions[mask], zero_division=0)
+                    by_slice[slice_names[slice_idx]] = {
+                        "n": int(np.sum(mask)),
+                        "acc": float(slice_acc),
+                        "f1": float(slice_f1),
+                    }
+                    print(f"      - {slice_names[slice_idx]:5s}: n={np.sum(mask):4d} | acc={slice_acc:.3f} | f1={slice_f1:.3f}")
+            
+            # Store results with legacy schema compatibility
             results[model_key] = {
-                'model_name': model_name,
-                'train_results': train_results,
-                'eval_results': eval_results,
-                'parameters': sum(p.numel() for p in model.parameters()),
-                'status': 'success'
+                "status": "success",
+                "model_name": model_name,
+                "accuracy": accuracy,
+                "f1": f1,
+                "predictions": predictions,
+                "labels": labels,
+                "by_slice": by_slice
             }
-            
-            trained_models[model_key] = model
-            
-            print(f"  ✅ {model_name}: F1 = {eval_results['f1']:.3f}, Acc = {eval_results['accuracy']:.3f}")
+            results[model_name] = {
+                'accuracy': accuracy,
+                'f1': f1,
+                'predictions': predictions,
+                'labels': labels,
+                'slice_labels': slice_labels,
+                'by_slice': by_slice,
+                'eval_results': {
+                    'accuracy': accuracy,
+                    'f1': f1,
+                    'predictions': predictions,
+                    'labels': labels,
+                    'by_slice': by_slice
+                },
+                'training_history': train_results,
+                'threshold': optimal_threshold,
+                'parameters': total_params
+            }
             
         except Exception as e:
             print(f"  ❌ {model_name}: Failed - {str(e)}")
-            results[model_key] = {
-                'model_name': model_name,
+            results[model_name] = {
                 'status': 'failed',
-                'error': str(e)
+                'error': str(e),
+                'f1': 0.0,
+                'accuracy': 0.0,
+                'predictions': [],
+                'labels': [],
+                'slice_labels': [],
+                'by_slice': {},
+                'eval_results': {'accuracy': 0.0, 'f1': 0.0, 'predictions': [], 'labels': [], 'by_slice': {}},
+                'training_history': {},
+                'threshold': 0.5,
+                'parameters': 0
             }
     
     # Analyze complementarity
@@ -335,15 +787,64 @@ def run_complementarity_experiment(config_size='lightweight', num_samples=1000, 
     results_file.parent.mkdir(parents=True, exist_ok=True)
     
     # Convert numpy arrays to lists for JSON serialization
-    for model_key, model_results in results.items():
-        if model_results.get('status') == 'success' and 'eval_results' in model_results:
-            eval_results = model_results['eval_results']
-            for key in ['predictions', 'probabilities', 'labels']:
-                if key in eval_results and isinstance(eval_results[key], np.ndarray):
-                    eval_results[key] = eval_results[key].tolist()
+    def convert_numpy_types(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        elif isinstance(obj, (np.float64, np.float32, np.float16)):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {k: convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy_types(item) for item in obj]
+        return obj
+    
+    results = convert_numpy_types(results)
     
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
+    
+    # Print results summary
+    print("\n📊 Results Summary:")
+    print("=" * 50)
+    for model_name, result in results.items():
+        if result.get('status') != 'failed':
+            print(f"  {model_name}: F1 = {result['f1']:.3f}, Acc = {result['accuracy']:.3f}")
+        else:
+            print(f"  {model_name}: FAILED - {result.get('error', 'Unknown error')}")
+    
+    # Add agreement diagnostics
+    print("\n🤝 Model Agreement Analysis:")
+    print("=" * 50)
+    if 'dense_only' in results and 'kg_only' in results:
+        d_preds = results['dense_only']['predictions']
+        k_preds = results['kg_only']['predictions']
+        agreement = (d_preds == k_preds).mean()
+        print(f"  Dense–KG agreement: {agreement:.3f}")
+        
+        # Per-slice positive rates
+        slice_names = ['dense', 'kg', 'both', 'none']
+        slice_labels = results['dense_only']['slice_labels']
+        labels = results['dense_only']['labels']
+        
+        for s, name in enumerate(slice_names):
+            mask = slice_labels == s
+            if mask.sum() > 0:
+                pos_rate = labels[mask].mean()
+                n_samples = mask.sum()
+                print(f"  Slice {name}: positive rate = {pos_rate:.2f} (n={n_samples})")
+    
+    # Analyze complementarity
+    print("\n🔍 Complementarity Analysis:")
+    print("=" * 50)
+    analyze_complementarity(results)
+    
+    # Gate diagnostics for hierarchical gating fusion
+    if 'fusion_hierarchical_gating' in results:
+        print("\n🚪 Gate Diagnostics:")
+        print("=" * 50)
+        analyze_gate_behavior(results['fusion_hierarchical_gating'])['eval_results']
     
     # Print final summary
     print_experiment_summary(results)
@@ -352,59 +853,122 @@ def run_complementarity_experiment(config_size='lightweight', num_samples=1000, 
     
     return results
 
-def analyze_complementarity(successful_models):
-    """Analyze complementarity between models"""
-    analysis = {}
+def analyze_complementarity(successful_models: Dict[str, Dict]) -> Dict[str, float]:
+    """Analyze complementarity between Dense and KG models"""
     
-    # Get model predictions
-    dense_results = successful_models.get('dense_only', {}).get('eval_results', {})
-    kg_results = successful_models.get('kg_only', {}).get('eval_results', {})
+    # Extract predictions from successful models
+    dense = successful_models['dense_only']
+    kg = successful_models['kg_only']
     
-    if dense_results and kg_results:
-        dense_preds = np.array(dense_results['predictions'])
-        kg_preds = np.array(kg_results['predictions'])
-        labels = np.array(dense_results['labels'])
-        
-        # Agreement analysis
-        agreement = (dense_preds == kg_preds).mean()
-        analysis['dense_kg_agreement'] = agreement
-        
-        # Complementarity score (when one is right and other is wrong)
-        dense_correct = (dense_preds == labels)
-        kg_correct = (kg_preds == labels)
-        
-        complementarity_cases = ((dense_correct & ~kg_correct) | (~dense_correct & kg_correct)).sum()
-        total_cases = len(labels)
-        analysis['complementarity_ratio'] = complementarity_cases / total_cases
-        
-        # Individual accuracies
-        analysis['dense_accuracy'] = dense_correct.mean()
-        analysis['kg_accuracy'] = kg_correct.mean()
-        
-        # Potential fusion improvement
-        oracle_correct = (dense_correct | kg_correct)
-        analysis['oracle_accuracy'] = oracle_correct.mean()
-        analysis['potential_improvement'] = analysis['oracle_accuracy'] - max(analysis['dense_accuracy'], analysis['kg_accuracy'])
+    dense_preds = np.array(dense['predictions'])
+    kg_preds = np.array(kg['predictions'])
+    labels = np.array(dense['labels'])  # Same for both
     
-    # Fusion model performance
-    fusion_models = {k: v for k, v in successful_models.items() if k.startswith('fusion_')}
-    if fusion_models:
-        fusion_accuracies = [v['eval_results']['accuracy'] for v in fusion_models.values()]
-        analysis['best_fusion_accuracy'] = max(fusion_accuracies)
-        analysis['avg_fusion_accuracy'] = np.mean(fusion_accuracies)
-        
-        # Compare with baselines
-        baseline_accuracies = []
-        if 'dense_only' in successful_models:
-            baseline_accuracies.append(successful_models['dense_only']['eval_results']['accuracy'])
-        if 'kg_only' in successful_models:
-            baseline_accuracies.append(successful_models['kg_only']['eval_results']['accuracy'])
-        
-        if baseline_accuracies:
-            best_baseline = max(baseline_accuracies)
-            analysis['fusion_improvement'] = analysis['best_fusion_accuracy'] - best_baseline
+    # Oracle performance (best of either model per example)
+    oracle_preds = np.maximum(dense_preds, kg_preds)
+    oracle_acc = accuracy_score(labels, oracle_preds)
+    
+    # Best single model performance
+    dense_acc = dense['accuracy']
+    kg_acc = kg['accuracy']
+    best_single_acc = max(dense_acc, kg_acc)
+    
+    # Gap closure for fusion models
+    gap_closures = {}
+    for name, model_results in successful_models.items():
+        if name not in ['dense_only', 'kg_only']:
+            fusion_acc = model_results['accuracy']
+            if oracle_acc > best_single_acc:  # Avoid division by zero
+                gap_closure = (fusion_acc - best_single_acc) / (oracle_acc - best_single_acc)
+                gap_closures[name] = gap_closure
+    
+    # Complementarity Index (CI) - probability both models wrong but fusion right
+    complementarity_indices = {}
+    for name, model_results in successful_models.items():
+        if name not in ['dense_only', 'kg_only']:
+            fusion_preds = np.array(model_results['predictions'])
+            
+            # Cases where both singles are wrong but fusion is right
+            both_wrong = (dense_preds != labels) & (kg_preds != labels)
+            fusion_right = (fusion_preds == labels)
+            complementarity_cases = both_wrong & fusion_right
+            
+            ci = complementarity_cases.mean()
+            complementarity_indices[name] = ci
+    
+    analysis = {
+        'oracle_accuracy': oracle_acc,
+        'best_single_accuracy': best_single_acc,
+        'gap_closures': gap_closures,
+        'complementarity_indices': complementarity_indices
+    }
     
     return analysis
+
+def compute_advanced_metrics(dense_preds, kg_preds, fusion_preds, labels):
+    """
+    Compute advanced evaluation metrics for complementarity analysis
+    
+    Args:
+        dense_preds: Dense model predictions [N]
+        kg_preds: KG model predictions [N] 
+        fusion_preds: Fusion model predictions [N]
+        labels: Ground truth labels [N]
+    
+    Returns:
+        Dictionary with advanced metrics
+    """
+    # Convert to numpy arrays and ensure integer predictions
+    d = np.asarray(dense_preds).astype(int)
+    k = np.asarray(kg_preds).astype(int)
+    f = np.asarray(fusion_preds).astype(int)
+    y = np.asarray(labels).astype(int)
+    
+    # Accuracies
+    d_ok, k_ok, f_ok = (d == y), (k == y), (f == y)
+    d_acc, k_acc, f_acc = d_ok.mean(), k_ok.mean(), f_ok.mean()
+    
+    # Oracle accuracy = max of (dense, kg) per item
+    oracle_ok = d_ok | k_ok
+    oracle_acc = oracle_ok.mean()
+    best_single = max(d_acc, k_acc)
+    
+    # Gap closure
+    denom = max(oracle_acc - best_single, 1e-9)
+    gap_closure = (f_acc - best_single) / denom if denom > 1e-9 else 0.0
+    
+    # Complementarity Index (fusion wins when both singles fail)
+    ci = np.mean(f_ok & (~d_ok) & (~k_ok))
+    
+    # Dense-KG agreement
+    agree = np.mean(d == k)
+    
+    # McNemar test (fusion vs best single)
+    best = d if d_acc >= k_acc else k
+    b_ok = (best == y)
+    n01 = np.sum(b_ok & (~f_ok))  # best correct, fusion wrong
+    n10 = np.sum((~b_ok) & f_ok)  # best wrong, fusion correct
+    
+    # Exact binomial test for McNemar
+    if n01 + n10 > 0:
+        n = n01 + n10
+        p = sum(comb(n, i) for i in range(n10, n+1)) * (0.5 ** n)
+        mcnemar_p = min(1.0, 2*p)  # two-sided
+    else:
+        mcnemar_p = 1.0
+    
+    return dict(
+        dense_accuracy=float(d_acc),
+        kg_accuracy=float(k_acc),
+        fusion_accuracy=float(f_acc),
+        oracle_accuracy=float(oracle_acc),
+        gap_closure=float(gap_closure),
+        complementarity_index=float(ci),
+        dense_kg_agreement=float(agree),
+        mcnemar_p_value=float(mcnemar_p),
+        mcnemar_n01=int(n01),
+        mcnemar_n10=int(n10)
+    )
 
 def print_experiment_summary(results):
     """Print comprehensive experiment summary"""
@@ -436,39 +1000,45 @@ def print_experiment_summary(results):
         
         # Complementarity analysis
         if 'complementarity_analysis' in results:
-            comp_analysis = results['complementarity_analysis']
-            print(f"\n🔍 Complementarity Analysis:")
-            print(f"  Dense-KG Agreement: {comp_analysis.get('dense_kg_agreement', 0):.3f}")
-            print(f"  Complementarity Ratio: {comp_analysis.get('complementarity_ratio', 0):.3f}")
-            print(f"  Potential Improvement: {comp_analysis.get('potential_improvement', 0):.3f}")
-            print(f"  Fusion Improvement: {comp_analysis.get('fusion_improvement', 0):.3f}")
+            ca = results['complementarity_analysis']
+            print(f"\n Complementarity Analysis (advanced):")
+            print(f"  Dense acc: {ca.get('dense_accuracy', 0):.3f} | KG acc: {ca.get('kg_accuracy', 0):.3f} | Fusion acc: {ca.get('fusion_accuracy', 0):.3f}")
+            print(f"  Oracle accuracy: {ca.get('oracle_accuracy', 0):.3f}")
+            print(f"  Gap closure: {ca.get('gap_closure', 0):.3f}  (target ≥ 0.30)")
+            print(f"  Complementarity Index: {ca.get('complementarity_index', 0):.3f}  (target ≥ 0.05)")
+            print(f"  Dense–KG agreement: {ca.get('dense_kg_agreement', 0):.3f}")
+            print(f"  McNemar p-value: {ca.get('mcnemar_p_value', 1.0):.4f}  (n01={ca.get('mcnemar_n01', 0)}, n10={ca.get('mcnemar_n10', 0)})")
+            print(f"  Best fusion acc: {ca.get('best_fusion_accuracy', 0):.3f} | Avg fusion acc: {ca.get('avg_fusion_accuracy', 0):.3f}")
             
-            if comp_analysis.get('fusion_improvement', 0) > 0.05:
-                print("  🎯 Significant complementarity detected! Fusion models show clear benefits.")
-            else:
-                print("  ⚠️  Limited complementarity observed. Consider different fusion strategies.")
+            # Success criteria
+            gap_closure = ca.get('gap_closure', 0)
+            ci = ca.get('complementarity_index', 0)
+            mcnemar_p = ca.get('mcnemar_p_value', 1.0)
+            
+            if gap_closure >= 0.30:
+                print("  Gap closure target achieved!")
+            if ci >= 0.05:
+                print("  Complementarity Index target achieved!")
+            if mcnemar_p < 0.01:
+                print("  Statistical significance achieved!")
+            if gap_closure < 0.30 or ci < 0.05:
+                print("  Targets not met. Consider different fusion strategies.")
     
     else:
-        print("❌ No models completed successfully")
+        print(" No models completed successfully")
 
 def main():
     """Main experiment runner"""
-    parser = argparse.ArgumentParser(description="Run complementarity experiments")
-    parser.add_argument('--config_size', type=str, default='lightweight',
-                       choices=['lightweight', 'standard', 'large'],
-                       help='Model configuration size')
-    parser.add_argument('--num_samples', type=int, default=1000,
-                       help='Number of training samples')
-    parser.add_argument('--num_epochs', type=int, default=5,
-                       help='Number of training epochs')
+    parser = argparse.ArgumentParser(description='Run complementarity experiments')
+    parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples per dataset')
+    parser.add_argument('--num_epochs', type=int, default=3, help='Number of training epochs')
     
     args = parser.parse_args()
     
-    # Run experiments
-    results = run_complementarity_experiment(
-        config_size=args.config_size,
+    results = run_complementarity_experiments(
         num_samples=args.num_samples,
-        num_epochs=args.num_epochs
+        num_epochs=args.num_epochs,
+        seed=42
     )
     
     return results
