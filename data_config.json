@@ -1,0 +1,108 @@
+{
+  "datasets": {
+    "qa": {
+      "natural_questions": {
+        "name": "Natural Questions",
+        "task": "question_answering",
+        "source": "google-research-datasets/natural-questions",
+        "splits": [
+          "train",
+          "dev"
+        ],
+        "size_gb": 42.0,
+        "samples": {
+          "train": 307373,
+          "dev": 7830
+        },
+        "description": "Real questions from Google search with Wikipedia answers"
+      },
+      "ms_marco_qa": {
+        "name": "MS MARCO QA",
+        "task": "question_answering",
+        "source": "microsoft/ms_marco",
+        "splits": [
+          "train",
+          "dev",
+          "test"
+        ],
+        "size_gb": 2.5,
+        "samples": {
+          "train": 808731,
+          "dev": 101093,
+          "test": 101092
+        },
+        "description": "Questions from Bing search logs with passage answers"
+      }
+    },
+    "ir": {
+      "ms_marco_passage": {
+        "name": "MS MARCO Passage",
+        "task": "information_retrieval",
+        "source": "microsoft/ms_marco",
+        "splits": [
+          "train",
+          "dev",
+          "test"
+        ],
+        "size_gb": 3.2,
+        "samples": {
+          "queries_train": 502939,
+          "queries_dev": 6980,
+          "passages": 8841823
+        },
+        "description": "Passage retrieval dataset from Bing search logs"
+      },
+      "beir": {
+        "name": "BEIR Benchmark",
+        "task": "information_retrieval",
+        "source": "BeIR/beir",
+        "datasets": {
+          "nfcorpus": {
+            "size_gb": 0.03,
+            "queries": 323,
+            "docs": 3633
+          },
+          "scifact": {
+            "size_gb": 0.01,
+            "queries": 300,
+            "docs": 5183
+          },
+          "arguana": {
+            "size_gb": 0.01,
+            "queries": 1406,
+            "docs": 8674
+          },
+          "fiqa": {
+            "size_gb": 0.1,
+            "queries": 648,
+            "docs": 57638
+          }
+        },
+        "description": "Diverse IR evaluation benchmark"
+      }
+    },
+    "kg": {
+      "wikidata5m": {
+        "name": "Wikidata5M",
+        "task": "knowledge_graph",
+        "source": "deepmind/wikidata5m",
+        "size_gb": 1.8,
+        "entities": 4594485,
+        "relations": 822,
+        "triples": 20624239,
+        "description": "Large-scale knowledge graph from Wikidata"
+      }
+    }
+  },
+  "preprocessing": {
+    "max_seq_length": 512,
+    "max_query_length": 64,
+    "max_passage_length": 256,
+    "batch_size": 32,
+    "num_workers": 4
+  },
+  "storage": {
+    "cache_dir": "~/.cache/kg_dense_research",
+    "temp_dir": "/tmp/kg_dense_processing"
+  }
+}
