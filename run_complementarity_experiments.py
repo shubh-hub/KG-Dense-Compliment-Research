@@ -356,12 +356,14 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
                 loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
                 loss = (loss_vec * slice_weights).mean()
                 
-                # Enforce negative margin on BOTH slice (index 2)
-                both_mask = (slice_labels == 2)
-                if both_mask.any():
-                    both_logits = outputs.squeeze()[both_mask]
-                    margin = 1.0
-                    loss = loss + 0.2 * F.relu(both_logits + margin).mean()
+                # Enforce negative margin on BOTH slice (index 2) - ONLY for fusion models
+                apply_both_margin = 'hierarchical_gating' in model.__class__.__name__.lower() or 'fusion' in model_name.lower()
+                if apply_both_margin:
+                    both_mask = (slice_labels == 2)
+                    if both_mask.any():
+                        both_logits = outputs.squeeze()[both_mask]
+                        margin = 1.0
+                        loss = loss + 0.2 * F.relu(both_logits + margin).mean()
                 
                 # Gate supervision loss
                 if aux_outputs is not None:
@@ -384,7 +386,7 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
                             dense_target[i] = 0.5
                     
                     gate_loss = F.mse_loss(kg_gate, kg_target) + F.mse_loss(dense_gate, dense_target)
-                    loss = loss + 0.4 * gate_loss  # Increased from 0.3 for sharper supervision
+                    loss = loss + 0.6 * gate_loss  # Increased from 0.4 for stronger supervision
                     
                     # Oracle distillation loss
                     if 'kg_aux_logits' in aux_outputs and 'dense_aux_logits' in aux_outputs:
@@ -433,12 +435,14 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
                 loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
                 loss = (loss_vec * slice_weights).mean()
                 
-                # Enforce negative margin on BOTH slice (index 2)
-                both_mask = (slice_labels == 2)
-                if both_mask.any():
-                    both_logits = outputs.squeeze()[both_mask]
-                    margin = 1.0
-                    loss = loss + 0.2 * F.relu(both_logits + margin).mean()
+                # Enforce negative margin on BOTH slice (index 2) - ONLY for fusion models
+                apply_both_margin = 'hierarchical_gating' in model.__class__.__name__.lower() or 'fusion' in model_name.lower()
+                if apply_both_margin:
+                    both_mask = (slice_labels == 2)
+                    if both_mask.any():
+                        both_logits = outputs.squeeze()[both_mask]
+                        margin = 1.0
+                        loss = loss + 0.2 * F.relu(both_logits + margin).mean()
             
             # Backward pass
             loss.backward()
@@ -467,14 +471,10 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
         'final_accuracy': epoch_accuracies[-1]
     }
 
-def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_type, use_balanced_accuracy=True):
-    """Find optimal threshold for binary classification using validation set
-    
-    Args:
-        use_balanced_accuracy: If True, optimize balanced accuracy instead of raw accuracy
-                              to prevent degenerate solutions with class imbalance
-    """
-    device = get_device()
+def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_type, device=None, use_balanced_accuracy=True):
+    """Compute optimal threshold using slice-aware metrics on validation set"""
+    if device is None:
+        device = get_device()
     model = model.to(device)
     global_edge_index = global_edge_index.to(device)
     global_edge_type = global_edge_type.to(device)
@@ -482,13 +482,15 @@ def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_
     model.eval()
     all_probs = []
     all_labels = []
+    all_slices = []
     
     with torch.no_grad():
-        for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
+        for batch_idx, (input_ids, attention_mask, entity_ids, labels, slice_labels) in enumerate(dataloader):
+            # Move batch tensors to the correct device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             entity_ids = entity_ids.to(device)
-            labels = labels.to(device).float()
+            labels = labels.to(device)
             
             batch = {
                 'input_ids': input_ids,
@@ -498,46 +500,50 @@ def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_
                 'edge_type': global_edge_type
             }
             
-            logits = model(batch, task='qa')
-            # Convert logits to probabilities for threshold search
+            logits = model(batch)
             probs = torch.sigmoid(logits.squeeze()).cpu().numpy()
+            
             all_probs.extend(probs)
             all_labels.extend(labels.cpu().numpy())
+            all_slices.extend(slice_labels.cpu().numpy())
     
     all_probs = np.array(all_probs)
     all_labels = np.array(all_labels)
+    all_slices = np.array(all_slices)
     
-    # Find threshold that maximizes the chosen metric
-    best_metric = -1
     best_threshold = 0.5
+    best_score = 0.0
     
+    # Use slice-aware metrics: F1 for Dense/KG/None, TNR for BOTH
     for threshold in np.arange(0.05, 0.95, 0.05):
-        predictions = (all_probs > threshold).astype(int)
+        preds = (all_probs > threshold).astype(int)
+        per_slice = []
         
-        if use_balanced_accuracy:
-            # Balanced accuracy to handle class imbalance
-            tp = ((predictions == 1) & (all_labels == 1)).sum()
-            tn = ((predictions == 0) & (all_labels == 0)).sum()
-            p = (all_labels == 1).sum()
-            n = (all_labels == 0).sum()
+        for s in range(4):  # 4 slices: dense, kg, both, none
+            mask = (all_slices == s)
+            if not mask.any():
+                continue
+            y_s, p_s = all_labels[mask], preds[mask]
             
-            if p > 0 and n > 0:
-                sensitivity = tp / p  # True positive rate
-                specificity = tn / n  # True negative rate
-                balanced_acc = (sensitivity + specificity) / 2.0
-            else:
-                balanced_acc = (predictions == all_labels).mean()
-            
-            metric = balanced_acc
-        else:
-            # Raw accuracy
-            metric = (predictions == all_labels).mean()
+            if s == 2:  # BOTH slice: all negatives by design, use TNR
+                tn = ((p_s == 0) & (y_s == 0)).sum()
+                fp = ((p_s == 1) & (y_s == 0)).sum()
+                tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                per_slice.append(tnr)
+            else:  # Dense/KG/None slices: use F1
+                tp = ((p_s == 1) & (y_s == 1)).sum()
+                fp = ((p_s == 1) & (y_s == 0)).sum()
+                fn = ((p_s == 0) & (y_s == 1)).sum()
+                f1 = (2*tp) / (2*tp + fp + fn) if (2*tp + fp + fn) > 0 else 0.0
+                per_slice.append(f1)
         
-        if metric > best_metric:
-            best_metric = metric
+        metric = float(np.mean(per_slice)) if per_slice else 0.0
+        
+        if metric > best_score:
+            best_score = metric
             best_threshold = threshold
     
-    return float(best_threshold)
+    return best_threshold
 
 def evaluate_model(model, dataloader, global_edge_index, global_edge_type, threshold=0.5):
     """Evaluate model and return predictions and labels"""
@@ -705,7 +711,7 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
             
             # Compute optimal threshold on fixed validation data
             print(f"\n  Computing optimal threshold for {model_name}...")
-            optimal_threshold = compute_optimal_threshold(model, val_dataloader, global_edge_index, global_edge_type)
+            optimal_threshold = compute_optimal_threshold(model, val_dataloader, global_edge_index, global_edge_type, device=get_device())
             print(f"    Optimal threshold: {optimal_threshold:.3f}")
             
             # Evaluate models with calibrated threshold
@@ -896,13 +902,13 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
         analyze_gate_diagnostics(results)
     
     # Print complementarity analysis
-    print_results(results, complementarity_metrics)
+    print_experiment_summary(results)
     
     # Add McNemar test for best fusion model
     best_fusion_key = None
     best_fusion_acc = 0
     for name, result in results.items():
-        if name not in ['dense_only', 'kg_only'] and result.get('status') == 'completed':
+        if name not in ['dense_only', 'kg_only'] and result.get('status') == 'success':
             if result.get('accuracy', 0) > best_fusion_acc:
                 best_fusion_acc = result['accuracy']
                 best_fusion_key = name

@@ -213,6 +213,7 @@ class HierarchicalGatingFusion(nn.Module):
     def __init__(self, hidden_dim: int = 768):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.gate_temp = 0.7  # Temperature for sharper softmax
         
         # Gating networks
         self.gate_head = nn.Sequential(
@@ -239,8 +240,8 @@ class HierarchicalGatingFusion(nn.Module):
         """
         # Compute gates with competitive softmax (not sigmoid+renorm)
         combined = torch.cat([kg_embeddings, dense_embeddings], dim=-1)
-        gate_logits = self.gate_head(combined)  # [batch_size, 2]
-        gates = F.softmax(gate_logits, dim=-1)  # Competitive gating
+        gate_logits = self.gate_head(combined)        # Compute gates with temperature-scaled softmax for sharpness
+        gates = F.softmax(gate_logits / self.gate_temp, dim=-1)  # Competitive gating
         
         # Apply gates
         kg_gated = gates[:, 0:1] * kg_embeddings
@@ -416,12 +417,12 @@ class KGDenseFusionModel(nn.Module):
             pooling=config.get('pooling', 'mean')
         )
         self.kg_encoder = KnowledgeGraphEncoder(
-            num_entities=config.get('num_entities', 100000),
-            num_relations=config.get('num_relations', 1000),
-            hidden_dim=config.get('hidden_dim', 768),
-            gnn_type=config.get('gnn_type', 'gcn'),
+            num_entities=config['num_entities'],
+            num_relations=config['num_relations'],
+            hidden_dim=config['hidden_dim'],
             num_layers=config.get('gnn_layers', 2),
-            num_bases=config.get('num_bases', 16)
+            num_bases=config.get('num_bases', 16),
+            dropout=config.get('dropout', 0.1)
         )
         
         # Fusion mechanisms
@@ -492,7 +493,7 @@ class KGDenseFusionModel(nn.Module):
 
             # 3) Cross-attend both ways (batch_first=True)
             kg_fused, dense_fused = self.fusion(kg_seq, dense_seq)  # token-level X-attn
-            fused_embeddings = kg_fused  # Already uses CLS token from fusion
+            fused_embeddings = 0.5 * (kg_fused + dense_fused)  # Average both streams
             aux_outputs = None
         elif self.fusion_type == 'hierarchical_gating' and return_aux_outputs:
             # Get gates and auxiliary logits for supervision
@@ -591,18 +592,15 @@ class BaselineModels:
 # Model configurations for different experiments
 MODEL_CONFIGS = {
     'm1_optimized': {
-        'dense_model': 'distilbert-base-uncased',
-        'hidden_dim': 384,
-        'gnn_type': 'rgcn',
-        'gnn_layers': 2,
-        'num_heads': 6,
-        'fusion_dim': 256,
-        'temperature': 0.1,
-        'num_entities': 100,
+        'hidden_dim': 768,
+        'num_entities': 500,
         'num_relations': 20,
         'num_bases': 16,
-        'freeze_lm': False,  # Unfreeze to learn synthetic bigrams
-        'pooling': 'cls'     # Use CLS pooling to preserve bigram order
+        'gnn_layers': 3,  # Increased from 2
+        'dropout': 0.05,  # Added dropout
+        'batch_size': 32,
+        'learning_rate': 1e-4,
+        'max_seq_length': 128
     },
     'lightweight': {
         'dense_model': 'distilbert-base-uncased',
