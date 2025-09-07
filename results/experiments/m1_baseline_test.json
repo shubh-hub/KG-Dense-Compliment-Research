@@ -1,0 +1,73 @@
+{
+  "lightweight": {
+    "batch_4": {
+      "dense": {
+        "avg_inference_time": 0.05490002632141113,
+        "memory_used_mb": 0.00244140625,
+        "throughput_samples_per_sec": 72.85971005882726,
+        "parameters": 66659330,
+        "status": "success"
+      },
+      "kg": {
+        "avg_inference_time": 0.00490412712097168,
+        "memory_used_mb": 0.00146484375,
+        "throughput_samples_per_sec": 815.6395422326368,
+        "parameters": 343682,
+        "status": "success"
+      },
+      "fusion": {
+        "avg_inference_time": 0.0467742919921875,
+        "memory_used_mb": 0.00146484375,
+        "throughput_samples_per_sec": 85.51706139492399,
+        "parameters": 69810050,
+        "status": "success"
+      }
+    },
+    "batch_8": {
+      "dense": {
+        "avg_inference_time": 0.07034618854522705,
+        "memory_used_mb": 0.00439453125,
+        "throughput_samples_per_sec": 113.72328999540083,
+        "parameters": 66659330,
+        "status": "success"
+      },
+      "kg": {
+        "avg_inference_time": 0.004748392105102539,
+        "memory_used_mb": 0.00146484375,
+        "throughput_samples_per_sec": 1684.780831684759,
+        "parameters": 343682,
+        "status": "success"
+      },
+      "fusion": {
+        "avg_inference_time": 0.08198058605194092,
+        "memory_used_mb": 0.00146484375,
+        "throughput_samples_per_sec": 97.58407917371306,
+        "parameters": 69810050,
+        "status": "success"
+      }
+    },
+    "batch_16": {
+      "dense": {
+        "avg_inference_time": 0.13046329021453856,
+        "memory_used_mb": 0.00830078125,
+        "throughput_samples_per_sec": 122.63986270535581,
+        "parameters": 66659330,
+        "status": "success"
+      },
+      "kg": {
+        "avg_inference_time": 0.004428291320800781,
+        "memory_used_mb": 0.00146484375,
+        "throughput_samples_per_sec": 3613.1317569022704,
+        "parameters": 343682,
+        "status": "success"
+      },
+      "fusion": {
+        "avg_inference_time": 0.1546696186065674,
+        "memory_used_mb": 0.001708984375,
+        "throughput_samples_per_sec": 103.4463015047522,
+        "parameters": 69810050,
+        "status": "success"
+      }
+    }
+  }
+}

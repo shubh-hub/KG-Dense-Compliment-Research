@@ -1,0 +1,30 @@
+{
+  "cross_attention": {
+    "avg_inference_time": 0.0824887752532959,
+    "memory_used_mb": 0.00146484375,
+    "throughput_samples_per_sec": 96.9828922230283,
+    "parameters": 69810050,
+    "status": "success"
+  },
+  "hierarchical_gating": {
+    "avg_inference_time": 0.08250532150268555,
+    "memory_used_mb": 0.00146484375,
+    "throughput_samples_per_sec": 96.96344253066876,
+    "parameters": 68479108,
+    "status": "success"
+  },
+  "tensor_bilinear": {
+    "avg_inference_time": 0.09857230186462403,
+    "memory_used_mb": 0.000732421875,
+    "throughput_samples_per_sec": 81.15870126465077,
+    "parameters": 105834626,
+    "status": "success"
+  },
+  "contrastive": {
+    "avg_inference_time": 0.08059959411621094,
+    "memory_used_mb": 0.00146484375,
+    "throughput_samples_per_sec": 99.2560829582511,
+    "parameters": 68479874,
+    "status": "success"
+  }
+}

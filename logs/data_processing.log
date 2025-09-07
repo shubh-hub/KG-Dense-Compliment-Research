@@ -1,0 +1,55 @@
+2025-09-06 17:36:50,233 - INFO - Starting full dataset processing for SOTA research...
+2025-09-06 17:36:50,233 - INFO - Processing Natural Questions dataset...
+2025-09-06 17:36:50,233 - ERROR - ✗ Failed to process Natural Questions: Directory /Users/shivam/Documents/Shubham/Research project/data/raw/qa/natural_questions is neither a `Dataset` directory nor a `DatasetDict` directory.
+2025-09-06 17:36:50,233 - INFO - Processing MS MARCO QA dataset...
+2025-09-06 17:36:53,090 - INFO - Loaded MS MARCO QA dataset: DatasetDict({
+    validation: Dataset({
+        features: ['answers', 'passages', 'query', 'query_id', 'query_type', 'wellFormedAnswers'],
+        num_rows: 101093
+    })
+    train: Dataset({
+        features: ['answers', 'passages', 'query', 'query_id', 'query_type', 'wellFormedAnswers'],
+        num_rows: 808731
+    })
+    test: Dataset({
+        features: ['answers', 'passages', 'query', 'query_id', 'query_type', 'wellFormedAnswers'],
+        num_rows: 101092
+    })
+})
+2025-09-06 17:36:53,091 - INFO - Processing validation split: 101093 examples
+2025-09-06 17:36:59,390 - INFO - Processed validation: 101035 QA pairs
+2025-09-06 17:36:59,390 - INFO - Processing train split: 808731 examples
+2025-09-06 17:37:52,834 - INFO - Processed train: 808300 QA pairs
+2025-09-06 17:37:52,836 - INFO - Processing test split: 101092 examples
+2025-09-06 17:37:58,627 - INFO - Processed test: 0 QA pairs
+2025-09-06 17:37:58,947 - INFO - Saved 101035 validation examples to /Users/shivam/Documents/Shubham/Research project/data/processed/qa/ms_marco_qa/validation.jsonl
+2025-09-06 17:38:01,583 - INFO - Saved 808300 train examples to /Users/shivam/Documents/Shubham/Research project/data/processed/qa/ms_marco_qa/train.jsonl
+2025-09-06 17:38:01,588 - INFO - Saved 0 test examples to /Users/shivam/Documents/Shubham/Research project/data/processed/qa/ms_marco_qa/test.jsonl
+2025-09-06 17:38:01,588 - INFO - ✓ MS MARCO QA processing completed: 909335 total examples
+2025-09-06 17:38:01,789 - INFO - Processing MS MARCO Passage dataset...
+2025-09-06 17:38:02,071 - INFO - Loaded MS MARCO Passage dataset: DatasetDict({
+    validation: Dataset({
+        features: ['answers', 'passages', 'query', 'query_id', 'query_type', 'wellFormedAnswers'],
+        num_rows: 10047
+    })
+    train: Dataset({
+        features: ['answers', 'passages', 'query', 'query_id', 'query_type', 'wellFormedAnswers'],
+        num_rows: 82326
+    })
+    test: Dataset({
+        features: ['answers', 'passages', 'query', 'query_id', 'query_type', 'wellFormedAnswers'],
+        num_rows: 9650
+    })
+})
+2025-09-06 17:38:02,071 - INFO - Processing validation split: 10047 examples
+2025-09-06 17:38:02,540 - INFO - Processed validation: 10047 query-passage pairs
+2025-09-06 17:38:02,540 - INFO - Processing train split: 82326 examples
+2025-09-06 17:38:06,296 - INFO - Processed train: 82326 query-passage pairs
+2025-09-06 17:38:06,297 - INFO - Processing test split: 9650 examples
+2025-09-06 17:38:06,728 - INFO - Processed test: 9650 query-passage pairs
+2025-09-06 17:38:06,753 - INFO - Saved 10047 validation examples to /Users/shivam/Documents/Shubham/Research project/data/processed/ir/ms_marco_passage/validation.jsonl
+2025-09-06 17:38:06,953 - INFO - Saved 82326 train examples to /Users/shivam/Documents/Shubham/Research project/data/processed/ir/ms_marco_passage/train.jsonl
+2025-09-06 17:38:06,975 - INFO - Saved 9650 test examples to /Users/shivam/Documents/Shubham/Research project/data/processed/ir/ms_marco_passage/test.jsonl
+2025-09-06 17:38:06,976 - INFO - ✓ MS MARCO Passage processing completed: 102023 total examples
+2025-09-06 17:38:06,984 - INFO - Processing Wikidata5M dataset...
+2025-09-06 17:38:06,986 - ERROR - ✗ Failed to process Wikidata5M: Not a gzipped file (b'<!')
