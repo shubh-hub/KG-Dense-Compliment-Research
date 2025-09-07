@@ -154,8 +154,8 @@ class CrossAttentionFusion(nn.Module):
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         
         # Cross-attention layers
-        self.kg_to_dense_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=0.1)
-        self.dense_to_kg_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=0.1)
+        self.kg_to_dense_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=0.1, batch_first=True)
+        self.dense_to_kg_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=0.1, batch_first=True)
         
         # Feed-forward networks
         self.kg_ffn = nn.Sequential(
@@ -177,34 +177,33 @@ class CrossAttentionFusion(nn.Module):
     def forward(self, kg_embeddings: torch.Tensor, dense_embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            kg_embeddings: KG embeddings [batch_size, hidden_dim]
-            dense_embeddings: Dense embeddings [batch_size, hidden_dim]
+            kg_embeddings: KG embeddings [batch_size, hidden_dim] or [batch_size, seq_len, hidden_dim]
+            dense_embeddings: Dense embeddings [batch_size, hidden_dim] or [batch_size, seq_len, hidden_dim]
         Returns:
             Fused KG and Dense embeddings
         """
-        # Ensure proper dimensions for attention
+        # Handle both pooled and sequence inputs
         if kg_embeddings.dim() == 2:
             kg_embeddings = kg_embeddings.unsqueeze(1)  # [batch_size, 1, hidden_dim]
         if dense_embeddings.dim() == 2:
             dense_embeddings = dense_embeddings.unsqueeze(1)  # [batch_size, 1, hidden_dim]
         
-        # Transpose for attention: [seq_len, batch_size, hidden_dim]
-        kg_emb = kg_embeddings.transpose(0, 1)
-        dense_emb = dense_embeddings.transpose(0, 1)
-        
-        # Cross-attention: KG attends to Dense
-        kg_attended, _ = self.kg_to_dense_attention(kg_emb, dense_emb, dense_emb)
-        kg_attended = self.layer_norm(kg_attended + kg_emb)
+        # Cross-attention with batch_first=True (no transpose needed)
+        kg_attended, _ = self.kg_to_dense_attention(query=kg_embeddings, key=dense_embeddings, value=dense_embeddings)
+        kg_attended = self.layer_norm(kg_attended + kg_embeddings)
         kg_attended = self.layer_norm(kg_attended + self.kg_ffn(kg_attended))
         
-        # Cross-attention: Dense attends to KG
-        dense_attended, _ = self.dense_to_kg_attention(dense_emb, kg_emb, kg_emb)
-        dense_attended = self.layer_norm(dense_attended + dense_emb)
+        dense_attended, _ = self.dense_to_kg_attention(query=dense_embeddings, key=kg_embeddings, value=kg_embeddings)
+        dense_attended = self.layer_norm(dense_attended + dense_embeddings)
         dense_attended = self.layer_norm(dense_attended + self.dense_ffn(dense_attended))
         
-        # Transpose back and squeeze
-        kg_fused = kg_attended.transpose(0, 1).squeeze(1)
-        dense_fused = dense_attended.transpose(0, 1).squeeze(1)
+        # Return first token (CLS) if sequence input, otherwise squeeze
+        if kg_attended.size(1) > 1:
+            kg_fused = kg_attended[:, 0, :]  # CLS token
+            dense_fused = dense_attended[:, 0, :]  # CLS token
+        else:
+            kg_fused = kg_attended.squeeze(1)
+            dense_fused = dense_attended.squeeze(1)
         
         return kg_fused, dense_fused
 
@@ -483,9 +482,17 @@ class KGDenseFusionModel(nn.Module):
         
         # Fusion with auxiliary outputs for hierarchical gating
         if self.fusion_type == 'cross_attention':
-            # Use pooled embeddings for M1 compatibility (avoid MPS memory issues)
-            kg_fused, dense_fused = self.fusion(kg_embeddings, dense_embeddings)
-            fused_embeddings = (kg_fused + dense_fused) / 2
+            # 1) Get token sequence from the text encoder
+            dense_seq = self.dense_encoder(batch['input_ids'], batch['attention_mask'], return_sequence=True)  # [B,T,H]
+
+            # 2) Tile the KG vector across tokens (MPS-safe: repeat, not expand)
+            kg_vec = self.kg_encoder(batch['entity_ids'], batch['edge_index'], batch.get('edge_type'))        # [B,H]
+            T = dense_seq.size(1)
+            kg_seq = kg_vec.unsqueeze(1).repeat(1, T, 1).contiguous()                                          # [B,T,H]
+
+            # 3) Cross-attend both ways (batch_first=True)
+            kg_fused, dense_fused = self.fusion(kg_seq, dense_seq)  # token-level X-attn
+            fused_embeddings = kg_fused  # Already uses CLS token from fusion
             aux_outputs = None
         elif self.fusion_type == 'hierarchical_gating' and return_aux_outputs:
             # Get gates and auxiliary logits for supervision

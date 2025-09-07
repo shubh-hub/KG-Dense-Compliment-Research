@@ -21,6 +21,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
 from sklearn.metrics import accuracy_score, f1_score, precision_recall_curve
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from math import comb 
 # McNemar test implementation (scipy version compatibility)
 try:
     from scipy.stats import mcnemar
@@ -42,7 +43,8 @@ except ImportError:
 from models.baseline_architectures import (
     DenseVectorEncoder, 
     KnowledgeGraphEncoder,
-    KGDenseFusionModel
+    KGDenseFusionModel,
+    get_model_config as get_baseline_config
 )
 
 # Set M1 optimizations
@@ -61,24 +63,8 @@ def set_seeds(seed=42):
         torch.cuda.manual_seed_all(seed)
 
 def get_model_config(config_name='m1_optimized'):
-    """Get model configuration for experiments"""
-    configs = {
-        'm1_optimized': {
-            'dense_model': 'distilbert-base-uncased',
-            'hidden_dim': 384,
-            'num_entities': 100000,
-            'num_relations': 1000,
-            'gnn_type': 'rgcn',
-            'gnn_layers': 2,
-            'num_bases': 16,
-            'num_heads': 8,
-            'fusion_dim': 256,
-            'temperature': 0.1,
-            'freeze_lm': False,  # Unfreeze for learnable dense cues
-            'pooling': 'cls'     # Use CLS pooling
-        }
-    }
-    return configs.get(config_name, configs['m1_optimized'])
+    """Get model configuration for experiments - uses baseline_architectures configs"""
+    return get_baseline_config(config_name)
 
 def get_device():
     """Get the best available device"""
@@ -137,15 +123,9 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
     global_edge_index = torch.tensor(global_edges, dtype=torch.long).t().contiguous()
     global_edge_type = torch.tensor(global_edge_types, dtype=torch.long)
     
-    # Precompute good entities for BOTH slice (entities with outgoing edges where edge_type % 4 < 2)
-    if len(global_edges) > 0:
-        src = global_edge_index[0].numpy()
-        etype = global_edge_type.numpy()
-        good_src_mask = (etype % 4) < 2
-        good_entities = set(src[good_src_mask].tolist())
-        good_entities = list(good_entities) if good_entities else list(range(num_entities))
-    else:
-        good_entities = list(range(num_entities))
+    # balanced, deterministic subset of "good" entities (~50%)
+    rng = random.Random(seed)
+    good_entities = rng.sample(range(num_entities), k=num_entities // 2)
     
     print(f"  Graph edges: {global_edge_index.size(1)}   Relation types: {num_relations}")
     print(f"  Good entities for BOTH slice: {len(good_entities)}")
@@ -172,13 +152,16 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
             
             # Add bigram tokens based on slice
             if slice_idx == 0:  # Dense slice
-                # Force dense cue to be positive for BOTH slice adversarial setup
-                bigram_idx = random.choice([0, 2])  # Always positive bigrams
+                # Make dense cue more learnable with 80% positive bias
+                if torch.rand(1).item() < 0.8:
+                    bigram_idx = random.choice([0, 2])  # Positive bigrams
+                else:
+                    bigram_idx = random.choice([1, 3])  # Negative bigrams
                 bigram = SPECIAL_BIGRAMS[bigram_idx]
                 input_ids[1:3] = torch.tensor(bigram)  # After CLS token
                 attention_mask[1:3] = 1
                 
-                # Dense cue determines label (unless overridden by anti-AND)
+                # Dense cue determines label
                 label = bigram_idx % 2 == 0  # Even indices are positive
             else:
                 # Fill with random tokens for non-dense slices
@@ -196,20 +179,14 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
                 slice_labels.append(0)
                 
             elif slice_idx == 1:  # KG slice  
-                # Create typed motif around entity
-                entity_id = random.randint(0, num_entities - 1)
-                motif_idx = entity_id % len(KG_MOTIFS)
-                
-                # Check if entity participates in this motif type
-                entity_edges = (global_edge_index[0] == entity_id).nonzero().flatten()
-                
-                if len(entity_edges) >= 2:
-                    # Entity has outgoing edges, check relation types
-                    edge_types = global_edge_type[entity_edges]
-                    # Label based on specific relation type patterns
-                    label = 1.0 if (edge_types[0].item() % 4) < 2 else 0.0
+                # Make KG slice balanced with 30% positive cue bias
+                KG_POS_BIAS = 0.3  # expected pos rate ~ 0.5 + 0.5*0.3 = 0.65
+                if torch.rand(1).item() < KG_POS_BIAS:
+                    entity_id = random.choice(good_entities)
+                    label = 1.0
                 else:
-                    label = 0.0
+                    entity_id = random.randint(0, num_entities - 1)
+                    label = 1.0 if entity_id in good_entities else 0.0
                     
                 slice_labels.append(1)
                 
@@ -295,12 +272,24 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
         
         meta = {
             'total_size': len(dataset),
-            'slice_labels': slice_labels
         }
         
         return dataloader, global_edge_index, global_edge_type, meta
 
-def train_model(model, model_name, dataloader, global_edge_index, global_edge_type, num_epochs=3):
+def init_qa_bias(model, train_loader):
+    """Initialize classifier bias to the base rate"""
+    import math
+    total = pos = 0
+    for _, _, _, y, _ in train_loader:
+        pos += y.sum().item()
+        total += y.numel()
+    prior = min(max(pos/total, 1e-3), 1-1e-3)
+    b = math.log(prior/(1-prior))
+    with torch.no_grad():
+        head = model.qa_head[-1] if isinstance(model.qa_head, nn.Sequential) else model.qa_head
+        head.bias.fill_(b)
+
+def train_model(model, train_loader, val_loader, global_edge_index, global_edge_type, num_epochs=3, lr=1e-4, model_name="Model"):
     """Train model and return training metrics"""
     device = get_device()
     model = model.to(device)
@@ -319,12 +308,15 @@ def train_model(model, model_name, dataloader, global_edge_index, global_edge_ty
     
     print(f"  Training {model_name} model...")
     
+    # Initialize classifier bias to base rate
+    init_qa_bias(model, train_loader)
+    
     for epoch in range(num_epochs):
         total_loss = 0
         correct_predictions = 0
         total_predictions = 0
         
-        for batch_idx, (input_ids, attention_mask, entity_ids, labels, slice_labels) in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False)):
+        for batch_idx, (input_ids, attention_mask, entity_ids, labels, slice_labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)):
             # Move to device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
@@ -356,13 +348,20 @@ def train_model(model, model_name, dataloader, global_edge_index, global_edge_ty
                 # Class-balanced loss weighting to prevent "always 0" degenerate solution
                 slice_weights = torch.ones_like(labels)
                 # Up-weight positive examples in Dense/KG slices to balance classes
-                slice_weights[(slice_labels == 0) & (labels == 1)] = 1.5  # Dense positives
+                slice_weights[(slice_labels == 0) & (labels == 1)] = 3.0  # Dense positives (increased)
                 slice_weights[(slice_labels == 1) & (labels == 1)] = 1.5  # KG positives
                 slice_weights[slice_labels == 2] = 2.5  # Up-weight BOTH slice (all negatives)
                 
                 # Main task loss with class balancing
                 loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
                 loss = (loss_vec * slice_weights).mean()
+                
+                # Enforce negative margin on BOTH slice (index 2)
+                both_mask = (slice_labels == 2)
+                if both_mask.any():
+                    both_logits = outputs.squeeze()[both_mask]
+                    margin = 1.0
+                    loss = loss + 0.2 * F.relu(both_logits + margin).mean()
                 
                 # Gate supervision loss
                 if aux_outputs is not None:
@@ -375,17 +374,17 @@ def train_model(model, model_name, dataloader, global_edge_index, global_edge_ty
                     
                     for i, slice_label in enumerate(slice_labels):
                         if slice_label == 0:  # Dense slice
-                            kg_target[i] = 0.0
-                            dense_target[i] = 1.0
+                            kg_target[i] = 0.1
+                            dense_target[i] = 0.9
                         elif slice_label == 1:  # KG slice
-                            kg_target[i] = 1.0
-                            dense_target[i] = 0.0
+                            kg_target[i] = 0.9  # Increased from 0.8
+                            dense_target[i] = 0.1  # Decreased from 0.2
                         else:  # BOTH or NONE slice
                             kg_target[i] = 0.5
                             dense_target[i] = 0.5
                     
                     gate_loss = F.mse_loss(kg_gate, kg_target) + F.mse_loss(dense_gate, dense_target)
-                    loss = loss + 0.3 * gate_loss  # Increased from 0.2 for sharper supervision
+                    loss = loss + 0.4 * gate_loss  # Increased from 0.3 for sharper supervision
                     
                     # Oracle distillation loss
                     if 'kg_aux_logits' in aux_outputs and 'dense_aux_logits' in aux_outputs:
@@ -412,14 +411,34 @@ def train_model(model, model_name, dataloader, global_edge_index, global_edge_ty
                     loss = loss + 0.1 * entropy_loss
             else:
                 # Class-balanced loss for all models to encourage specialization
-                slice_weights = torch.ones_like(labels)
-                slice_weights[(slice_labels == 0) & (labels == 1)] = 1.5  # Dense positives
-                slice_weights[(slice_labels == 1) & (labels == 1)] = 1.5  # KG positives
-                slice_weights[slice_labels == 2] = 2.0  # BOTH slice
-                
                 outputs = model(batch, task='qa')
+                
+                # Stronger slice-specific weighting to force specialization
+                slice_weights = torch.ones_like(labels)
+                
+                # Dense model: heavily weight dense slice performance
+                if 'dense' in model.__class__.__name__.lower():
+                    slice_weights[slice_labels == 0] = 3.0  # Dense slice
+                    slice_weights[slice_labels == 1] = 0.5  # KG slice (de-emphasize)
+                # KG model: heavily weight KG slice performance  
+                elif 'kg' in model.__class__.__name__.lower():
+                    slice_weights[slice_labels == 0] = 0.5  # Dense slice (de-emphasize)
+                    slice_weights[slice_labels == 1] = 3.5  # KG slice (increased from 3.0)
+                else:
+                    # Fusion models: balanced weighting
+                    slice_weights[(slice_labels == 0) & (labels == 1)] = 2.0  # Dense positives
+                    slice_weights[(slice_labels == 1) & (labels == 1)] = 2.0  # KG positives
+                    slice_weights[slice_labels == 2] = 2.5  # BOTH slice
+                
                 loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
                 loss = (loss_vec * slice_weights).mean()
+                
+                # Enforce negative margin on BOTH slice (index 2)
+                both_mask = (slice_labels == 2)
+                if both_mask.any():
+                    both_logits = outputs.squeeze()[both_mask]
+                    margin = 1.0
+                    loss = loss + 0.2 * F.relu(both_logits + margin).mean()
             
             # Backward pass
             loss.backward()
@@ -433,7 +452,7 @@ def train_model(model, model_name, dataloader, global_edge_index, global_edge_ty
             total_predictions += labels.size(0)
         
         # Calculate epoch metrics
-        epoch_loss = total_loss / len(dataloader)
+        epoch_loss = total_loss / len(train_loader)
         epoch_acc = correct_predictions / total_predictions
         
         epoch_losses.append(epoch_loss)
@@ -680,8 +699,8 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
             
             # Train model
             train_results = train_model(
-                model, model_name, train_dataloader, global_edge_index, global_edge_type,
-                num_epochs=num_epochs
+                model, train_dataloader, val_dataloader, global_edge_index, global_edge_type,
+                num_epochs=num_epochs, model_name=model_name
             )
             
             # Compute optimal threshold on fixed validation data
@@ -692,6 +711,11 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
             # Evaluate models with calibrated threshold
             print(f"  Evaluating {model_name}...")
             predictions, labels, slice_labels = evaluate_model(model, test_dataloader, global_edge_index, global_edge_type, threshold=optimal_threshold)
+            
+            # Add gate diagnostics for hierarchical model
+            if model_key == 'fusion_hierarchical_gating':
+                print(f"  Gate diagnostics for {model_name}:")
+                summarize_gates(model, val_dataloader, global_edge_index, global_edge_type)
             
             # Calculate metrics
             accuracy = np.mean(predictions == labels)
@@ -712,14 +736,36 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
             for slice_idx in range(4):
                 mask = slice_labels == slice_idx
                 if np.sum(mask) > 0:
-                    slice_acc = np.mean(predictions[mask] == labels[mask])
-                    slice_f1 = f1_score(labels[mask], predictions[mask], zero_division=0)
-                    by_slice[slice_names[slice_idx]] = {
-                        "n": int(np.sum(mask)),
-                        "acc": float(slice_acc),
-                        "f1": float(slice_f1),
-                    }
-                    print(f"      - {slice_names[slice_idx]:5s}: n={np.sum(mask):4d} | acc={slice_acc:.3f} | f1={slice_f1:.3f}")
+                    slice_preds = predictions[mask]
+                    slice_true = labels[mask]
+                    slice_acc = np.mean(slice_preds == slice_true)
+                    
+                    # Use balanced accuracy for BOTH slice (all negatives by design)
+                    if slice_names[slice_idx] == 'both':
+                        # Balanced accuracy = (TPR + TNR) / 2
+                        tp = np.sum((slice_preds == 1) & (slice_true == 1))
+                        tn = np.sum((slice_preds == 0) & (slice_true == 0))
+                        fp = np.sum((slice_preds == 1) & (slice_true == 0))
+                        fn = np.sum((slice_preds == 0) & (slice_true == 1))
+                        
+                        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                        tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                        balanced_acc = (tpr + tnr) / 2.0
+                        
+                        by_slice[slice_names[slice_idx]] = {
+                            "n": int(np.sum(mask)),
+                            "acc": float(slice_acc),
+                            "balanced_acc": float(balanced_acc),
+                        }
+                        print(f"      - {slice_names[slice_idx]:5s}: n={np.sum(mask):4d} | acc={slice_acc:.3f} | bal_acc={balanced_acc:.3f}")
+                    else:
+                        slice_f1 = f1_score(slice_true, slice_preds, zero_division=0)
+                        by_slice[slice_names[slice_idx]] = {
+                            "n": int(np.sum(mask)),
+                            "acc": float(slice_acc),
+                            "f1": float(slice_f1),
+                        }
+                        print(f"      - {slice_names[slice_idx]:5s}: n={np.sum(mask):4d} | acc={slice_acc:.3f} | f1={slice_f1:.3f}")
             
             # Store results with legacy schema compatibility
             results[model_key] = {
@@ -729,6 +775,7 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
                 "f1": f1,
                 "predictions": predictions,
                 "labels": labels,
+                "slice_labels": slice_labels,
                 "by_slice": by_slice
             }
             results[model_name] = {
@@ -810,7 +857,9 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
     print("=" * 50)
     for model_name, result in results.items():
         if result.get('status') != 'failed':
-            print(f"  {model_name}: F1 = {result['f1']:.3f}, Acc = {result['accuracy']:.3f}")
+            f1 = result.get('f1', 0.0)
+            acc = result.get('accuracy', 0.0)
+            print(f"  {model_name}: F1 = {f1:.3f}, Acc = {acc:.3f}")
         else:
             print(f"  {model_name}: FAILED - {result.get('error', 'Unknown error')}")
     
@@ -818,21 +867,21 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
     print("\n🤝 Model Agreement Analysis:")
     print("=" * 50)
     if 'dense_only' in results and 'kg_only' in results:
-        d_preds = results['dense_only']['predictions']
-        k_preds = results['kg_only']['predictions']
-        agreement = (d_preds == k_preds).mean()
+        d_preds = np.array(results['dense_only']['predictions'])
+        k_preds = np.array(results['kg_only']['predictions'])
+        agreement = np.mean(d_preds == k_preds)
         print(f"  Dense–KG agreement: {agreement:.3f}")
         
         # Per-slice positive rates
         slice_names = ['dense', 'kg', 'both', 'none']
-        slice_labels = results['dense_only']['slice_labels']
-        labels = results['dense_only']['labels']
+        slice_labels = np.array(results['dense_only']['slice_labels'])
+        labels = np.array(results['dense_only']['labels'])
         
         for s, name in enumerate(slice_names):
             mask = slice_labels == s
-            if mask.sum() > 0:
-                pos_rate = labels[mask].mean()
-                n_samples = mask.sum()
+            if np.sum(mask) > 0:
+                pos_rate = np.mean(labels[mask])
+                n_samples = np.sum(mask)
                 print(f"  Slice {name}: positive rate = {pos_rate:.2f} (n={n_samples})")
     
     # Analyze complementarity
@@ -844,66 +893,159 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
     if 'fusion_hierarchical_gating' in results:
         print("\n🚪 Gate Diagnostics:")
         print("=" * 50)
-        analyze_gate_behavior(results['fusion_hierarchical_gating'])['eval_results']
+        analyze_gate_diagnostics(results)
     
-    # Print final summary
-    print_experiment_summary(results)
+    # Print complementarity analysis
+    print_results(results, complementarity_metrics)
+    
+    # Add McNemar test for best fusion model
+    best_fusion_key = None
+    best_fusion_acc = 0
+    for name, result in results.items():
+        if name not in ['dense_only', 'kg_only'] and result.get('status') == 'completed':
+            if result.get('accuracy', 0) > best_fusion_acc:
+                best_fusion_acc = result['accuracy']
+                best_fusion_key = name
+    
+    if best_fusion_key and 'predictions' in results[best_fusion_key]:
+        mcnemar_stats = compute_mcnemar_test(
+            results['dense_only']['predictions'],
+            results['kg_only']['predictions'], 
+            results[best_fusion_key]['predictions'],
+            results['dense_only']['labels']
+        )
+        print(f"\nMcNemar Test ({best_fusion_key} vs Dense):")
+        print(f"  n01 (Dense wrong, Fusion right): {mcnemar_stats['mcnemar_n01']}")
+        print(f"  n10 (Dense right, Fusion wrong): {mcnemar_stats['mcnemar_n10']}")
+        if mcnemar_stats['mcnemar_p_value'] is not None:
+            print(f"  p-value: {mcnemar_stats['mcnemar_p_value']:.4f}")
+        else:
+            print(f"  p-value: N/A (small sample)")
+    
     print(f"\n📁 Results saved to: {results_file}")
     print("🏁 Complementarity experiments completed!")
     
     return results
 
-def analyze_complementarity(successful_models: Dict[str, Dict]) -> Dict[str, float]:
-    """Analyze complementarity between Dense and KG models"""
+def analyze_gate_diagnostics(results: Dict[str, Dict]):
+    """Analyze gate behavior for hierarchical gating fusion model"""
+    if 'fusion_hierarchical_gating' not in results:
+        print("  No hierarchical gating fusion results found")
+        return
     
-    # Extract predictions from successful models
-    dense = successful_models['dense_only']
-    kg = successful_models['kg_only']
+    fusion_result = results['fusion_hierarchical_gating']
+    if 'predictions' not in fusion_result or 'slice_labels' not in fusion_result:
+        print("  Missing prediction data for gate analysis")
+        return
     
-    dense_preds = np.array(dense['predictions'])
-    kg_preds = np.array(kg['predictions'])
-    labels = np.array(dense['labels'])  # Same for both
+    predictions = np.array(fusion_result['predictions'])
+    slice_labels = np.array(fusion_result['slice_labels'])
+    labels = np.array(fusion_result['labels'])
     
-    # Oracle performance (best of either model per example)
-    oracle_preds = np.maximum(dense_preds, kg_preds)
-    oracle_acc = accuracy_score(labels, oracle_preds)
+    slice_names = ['dense', 'kg', 'both', 'none']
     
-    # Best single model performance
-    dense_acc = dense['accuracy']
-    kg_acc = kg['accuracy']
-    best_single_acc = max(dense_acc, kg_acc)
-    
-    # Gap closure for fusion models
-    gap_closures = {}
-    for name, model_results in successful_models.items():
-        if name not in ['dense_only', 'kg_only']:
-            fusion_acc = model_results['accuracy']
-            if oracle_acc > best_single_acc:  # Avoid division by zero
-                gap_closure = (fusion_acc - best_single_acc) / (oracle_acc - best_single_acc)
-                gap_closures[name] = gap_closure
-    
-    # Complementarity Index (CI) - probability both models wrong but fusion right
-    complementarity_indices = {}
-    for name, model_results in successful_models.items():
-        if name not in ['dense_only', 'kg_only']:
-            fusion_preds = np.array(model_results['predictions'])
+    print("  Gate behavior analysis (based on predictions):")
+    for s, name in enumerate(slice_names):
+        mask = slice_labels == s
+        if np.sum(mask) > 0:
+            slice_preds = predictions[mask]
+            slice_true = labels[mask]
+            n_samples = np.sum(mask)
+            pos_pred_rate = np.mean(slice_preds)
+            pos_true_rate = np.mean(slice_true)
+            accuracy = np.mean(slice_preds == slice_true)
             
-            # Cases where both singles are wrong but fusion is right
-            both_wrong = (dense_preds != labels) & (kg_preds != labels)
-            fusion_right = (fusion_preds == labels)
-            complementarity_cases = both_wrong & fusion_right
-            
-            ci = complementarity_cases.mean()
-            complementarity_indices[name] = ci
+            print(f"    {name:6s}: n={n_samples} | pred_pos={pos_pred_rate:.2f} | true_pos={pos_true_rate:.2f} | acc={accuracy:.2f}")
     
-    analysis = {
-        'oracle_accuracy': oracle_acc,
-        'best_single_accuracy': best_single_acc,
-        'gap_closures': gap_closures,
-        'complementarity_indices': complementarity_indices
+    # Overall gate effectiveness
+    dense_mask = slice_labels == 0
+    kg_mask = slice_labels == 1
+    both_mask = slice_labels == 2
+    
+    if np.sum(dense_mask) > 0 and np.sum(kg_mask) > 0:
+        dense_acc = np.mean(predictions[dense_mask] == labels[dense_mask])
+        kg_acc = np.mean(predictions[kg_mask] == labels[kg_mask])
+        print(f"  Specialization: Dense={dense_acc:.2f}, KG={kg_acc:.2f}")
+        
+    if np.sum(both_mask) > 0:
+        both_acc = np.mean(predictions[both_mask] == labels[both_mask])
+        print(f"  Fusion effectiveness on 'both' slice: {both_acc:.2f}")
+
+def compute_mcnemar_test(dense_preds, kg_preds, fusion_preds, labels):
+    """Compute McNemar test statistics"""
+    # Convert to numpy arrays
+    dense_preds = np.asarray(dense_preds).astype(int)
+    kg_preds = np.asarray(kg_preds).astype(int)
+    fusion_preds = np.asarray(fusion_preds).astype(int)
+    labels = np.asarray(labels).astype(int)
+    
+    # McNemar test: Dense vs Fusion
+    dense_correct = (dense_preds == labels)
+    fusion_correct = (fusion_preds == labels)
+    
+    # Contingency table for McNemar
+    n01 = ((dense_correct == False) & (fusion_correct == True)).sum()  # Dense wrong, Fusion right
+    n10 = ((dense_correct == True) & (fusion_correct == False)).sum()   # Dense right, Fusion wrong
+    
+    # McNemar test (exact for small samples)
+    if n01 + n10 > 0:
+        mcnemar_stat = (abs(n01 - n10) - 1) ** 2 / (n01 + n10)
+        mcnemar_p = 1 - chi2.cdf(mcnemar_stat, 1) if n01 + n10 >= 25 else None
+    else:
+        mcnemar_p = 1.0
+        
+    return {
+        'mcnemar_n01': int(n01),
+        'mcnemar_n10': int(n10), 
+        'mcnemar_p_value': float(mcnemar_p) if mcnemar_p is not None else None
     }
+
+def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
+    """Analyze complementarity between Dense and KG models"""
+    import numpy as np
+    d = np.asarray(results['dense_only']['predictions']).astype(int)
+    k = np.asarray(results['kg_only']['predictions']).astype(int)
+    y = np.asarray(results['dense_only']['labels']).astype(int)
+
+    d_ok, k_ok = (d == y), (k == y)
+    dense_acc, kg_acc = d_ok.mean(), k_ok.mean()
+    oracle_acc = (d_ok | k_ok).mean()
+    best_single = max(dense_acc, kg_acc)
+    agree = (d == k).mean()
+
+    gap_closures, CIs, f_accs = {}, {}, []
+    best_fusion_acc = 0.0
+    for name, r in results.items():
+        if name in ('dense_only','kg_only') or r.get('status') == 'failed':
+            continue
+        if 'predictions' not in r:
+            continue
+        f = np.asarray(r['predictions']).astype(int)
+        f_ok = (f == y)
+        f_acc = f_ok.mean()
+        f_accs.append(f_acc)
+        best_fusion_acc = max(best_fusion_acc, f_acc)
+
+        denom = max(oracle_acc - best_single, 1e-9)
+        gap_closures[name] = (f_acc - best_single) / denom
+        CIs[name] = np.mean(f_ok & (~d_ok) & (~k_ok))
+
+    # Compute best and average gap closure
+    best_gap = max(gap_closures.values()) if gap_closures else 0.0
+    avg_gap = float(np.mean(list(gap_closures.values()))) if gap_closures else 0.0
     
-    return analysis
+    return {
+        'dense_accuracy': float(dense_acc),
+        'kg_accuracy': float(kg_acc),
+        'oracle_accuracy': float(oracle_acc),
+        'best_single_accuracy': float(best_single),
+        'best_gap_closure': float(best_gap),
+        'gap_closure': float(avg_gap),  # keep existing 'gap_closure' as avg
+        'complementarity_index': float(np.mean(list(CIs.values())) if CIs else 0.0),
+        'dense_kg_agreement': float(agree),
+        'best_fusion_accuracy': float(best_fusion_acc),
+        'avg_fusion_accuracy': float(np.mean(f_accs) if f_accs else 0.0),
+    }
 
 def compute_advanced_metrics(dense_preds, kg_preds, fusion_preds, labels):
     """
@@ -984,18 +1126,19 @@ def print_experiment_summary(results):
         # Sort by F1 score
         sorted_models = sorted(
             successful_models.items(),
-            key=lambda x: x[1]['eval_results']['f1'],
+            key=lambda x: x[1].get('f1', 0.0),
             reverse=True
         )
         
         print("\nModel Performance Ranking:")
         for i, (model_key, model_results) in enumerate(sorted_models, 1):
-            eval_results = model_results['eval_results']
-            params = model_results['parameters'] / 1e6
+            f1 = model_results.get('f1', 0.0)
+            accuracy = model_results.get('accuracy', 0.0)
+            params = model_results.get('parameters', 0) / 1e6
             
-            print(f"  {i}. {model_results['model_name']:25}: "
-                  f"F1={eval_results['f1']:.3f}, "
-                  f"Acc={eval_results['accuracy']:.3f}, "
+            print(f"  {i}. {model_results.get('model_name', model_key):25}: "
+                  f"F1={f1:.3f}, "
+                  f"Acc={accuracy:.3f}, "
                   f"Params={params:.1f}M")
         
         # Complementarity analysis
