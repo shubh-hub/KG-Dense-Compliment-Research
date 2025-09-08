@@ -1,0 +1,251 @@
+{
+  "dense_only": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "Dense-Only Baseline": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "kg_only": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "KG-Only Baseline": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "fusion_cross_attention": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "Cross-Attention Fusion": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "fusion_hierarchical_gating": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "Hierarchical Gating Fusion": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "fusion_tensor_bilinear": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "Tensor Bilinear Fusion": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "fusion_contrastive": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "Contrastive Fusion": {
+    "status": "failed",
+    "error": "name 'val_metrics' is not defined",
+    "f1": 0.0,
+    "accuracy": 0.0,
+    "predictions": [],
+    "labels": [],
+    "slice_labels": [],
+    "by_slice": {},
+    "eval_results": {
+      "accuracy": 0.0,
+      "f1": 0.0,
+      "predictions": [],
+      "labels": [],
+      "by_slice": {}
+    },
+    "training_history": {},
+    "threshold": 0.5,
+    "parameters": 0
+  },
+  "experiment_metadata": {
+    "timestamp": "2025-09-08T17:54:15.973171",
+    "num_samples": 2000,
+    "num_epochs": 5,
+    "seed": 42,
+    "calibrated_thresholds": true,
+    "total_runtime_seconds": 519.36851811409,
+    "git_commit": "2a5230847709db9cd59ebec617bd6a49be5ab9db"
+  }
+}

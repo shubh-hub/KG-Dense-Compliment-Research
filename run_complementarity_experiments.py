@@ -9,7 +9,10 @@ import json
 import numpy as np
 import os
 import random
+import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -46,6 +49,63 @@ from models.baseline_architectures import (
     KGDenseFusionModel,
     get_model_config as get_baseline_config
 )
+
+def _collect_val_logits_labels_slices(model, dataloader, global_edge_index, global_edge_type, device=None):
+    """Run model on a dataloader and collect raw logits, labels, and slice labels."""
+    if device is None:
+        device = get_device()
+    model = model.to(device)
+    global_edge_index = global_edge_index.to(device)
+    global_edge_type = global_edge_type.to(device)
+
+    model.eval()
+    logits_all = []
+    labels_all = []
+    slices_all = []
+
+    with torch.no_grad():
+        for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            entity_ids = entity_ids.to(device)
+            labels = labels.to(device).float()
+
+            batch = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'entity_ids': entity_ids,
+                'edge_index': global_edge_index,
+                'edge_type': global_edge_type
+            }
+            out = model(batch, task='qa')
+            if isinstance(out, tuple):
+                out = out[0]
+            logits_all.append(out.detach().view(-1).cpu())
+            labels_all.append(labels.detach().view(-1).cpu())
+            slices_all.append(slice_labels.detach().view(-1).cpu())
+
+    logits = torch.cat(logits_all, dim=0)        # [N]
+    labels = torch.cat(labels_all, dim=0).float() # [N]
+    slices = torch.cat(slices_all, dim=0).long() # [N]
+    return logits, labels, slices
+
+
+def _fit_platt_scaler(logits: torch.Tensor, labels: torch.Tensor, steps: int = 200, lr: float = 0.1):
+    """
+    Fit a Platt scaler (sigmoid(a * logit + b)) on validation logits via Adam.
+    Runs on CPU for stability; super fast for N~200.
+    """
+    X = logits.detach().cpu()
+    y = labels.detach().cpu()
+    a = torch.tensor(1.0, requires_grad=True)
+    b = torch.tensor(0.0, requires_grad=True)
+    opt = torch.optim.Adam([a, b], lr=lr)
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = F.binary_cross_entropy_with_logits(a * X + b, y)
+        loss.backward()
+        opt.step()
+    return float(a.detach().item()), float(b.detach().item())
 
 # Set M1 optimizations
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -506,107 +566,104 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
         
         print(f"    Epoch {epoch+1}: Loss={epoch_loss:.4f}, Acc={epoch_acc:.4f}")
     
+    # Minimal, defined training diagnostics
     return {
         'losses': epoch_losses,
-        'accuracies': epoch_accuracies,
-        'final_loss': epoch_losses[-1],
-        'final_accuracy': epoch_accuracies[-1]
+        'train_accuracies': epoch_accuracies,
+        'final_train_acc': epoch_accuracies[-1] if epoch_accuracies else 0.0
     }
 
-def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_type, device=None, use_balanced_accuracy=True):
-    """Compute optimal threshold using slice-aware metrics on validation set"""
+def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_type, device=None, calibrate=True):
+    """
+    Compute optimal threshold on validation set.
+    - Optional Platt scaling (calibrate=True) to fix miscalibration.
+    - Slice-aware objective: F1 for dense/kg/none, TNR for both.
+    - Uses a safer mid-range threshold grid to avoid pathological 0.05/0.95 picks.
+    Returns: (best_threshold, platt_dict_or_None)
+    """
     if device is None:
         device = get_device()
-    model = model.to(device)
-    global_edge_index = global_edge_index.to(device)
-    global_edge_type = global_edge_type.to(device)
-    
-    model.eval()
-    all_probs = []
-    all_labels = []
-    all_slices = []
-    
-    with torch.no_grad():
-        for batch_idx, (input_ids, attention_mask, entity_ids, labels, slice_labels) in enumerate(dataloader):
-            # Move batch tensors to the correct device
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            entity_ids = entity_ids.to(device)
-            labels = labels.to(device)
-            
-            batch = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'entity_ids': entity_ids,
-                'edge_index': global_edge_index,
-                'edge_type': global_edge_type
-            }
-            
-            out = model(batch, task='qa')
-            logits = out[0] if isinstance(out, tuple) else out
-            probs = torch.sigmoid(logits.squeeze()).cpu().numpy()
-            
-            all_probs.extend(probs)
-            all_labels.extend(labels.cpu().numpy())
-            all_slices.extend(slice_labels.cpu().numpy())
-    
-    all_probs = np.array(all_probs)
-    all_labels = np.array(all_labels)
-    all_slices = np.array(all_slices)
-    
-    best_threshold = 0.5
-    best_score = 0.0
-    
-    # Use slice-aware metrics: F1 for Dense/KG/None, TNR for BOTH
-    for threshold in np.arange(0.05, 0.95, 0.05):
-        preds = (all_probs > threshold).astype(int)
+
+    # 1) Collect raw logits/labels/slices on val
+    logits_t, labels_t, slices_t = _collect_val_logits_labels_slices(
+        model, dataloader, global_edge_index, global_edge_type, device=device
+    )
+
+    # 2) Optional Platt scaling on validation
+    if calibrate:
+        a, b = _fit_platt_scaler(logits_t, labels_t)
+        probs = torch.sigmoid(a * logits_t + b).numpy()
+        platt = {'a': a, 'b': b}
+    else:
+        probs = torch.sigmoid(logits_t).numpy()
+        platt = None
+
+    labels = labels_t.numpy().astype(int)
+    slices = slices_t.numpy().astype(int)
+
+    # 3) Threshold search (mid-range grid)
+    best_threshold, best_score = 0.5, -1.0
+    grid = np.linspace(0.10, 0.90, 17)  # avoid 0.05/0.95 extremes
+
+    for threshold in grid:
+        preds = (probs > threshold).astype(int)
         per_slice = []
-        
-        for s in range(4):  # 4 slices: dense, kg, both, none
-            mask = (all_slices == s)
-            if not mask.any():
+        for s in range(4):  # dense=0, kg=1, both=2, none=3
+            m = (slices == s)
+            if not np.any(m):
                 continue
-            y_s, p_s = all_labels[mask], preds[mask]
-            
-            if s == 2:  # BOTH slice: all negatives by design, use TNR
-                tn = ((p_s == 0) & (y_s == 0)).sum()
-                fp = ((p_s == 1) & (y_s == 0)).sum()
+            y_s, p_s = labels[m], preds[m]
+            if s == 2:  # BOTH: use TNR
+                tn = np.sum((p_s == 0) & (y_s == 0))
+                fp = np.sum((p_s == 1) & (y_s == 0))
                 tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
                 per_slice.append(tnr)
-            else:  # Dense/KG/None slices: use F1
-                tp = ((p_s == 1) & (y_s == 1)).sum()
-                fp = ((p_s == 1) & (y_s == 0)).sum()
-                fn = ((p_s == 0) & (y_s == 1)).sum()
-                f1 = (2*tp) / (2*tp + fp + fn) if (2*tp + fp + fn) > 0 else 0.0
+            else:       # others: F1
+                tp = np.sum((p_s == 1) & (y_s == 1))
+                fp = np.sum((p_s == 1) & (y_s == 0))
+                fn = np.sum((p_s == 0) & (y_s == 1))
+                denom = (2 * tp + fp + fn)
+                f1 = (2 * tp) / denom if denom > 0 else 0.0
                 per_slice.append(f1)
-        
-        metric = float(np.mean(per_slice)) if per_slice else 0.0
-        
-        if metric > best_score:
-            best_score = metric
-            best_threshold = threshold
-    
-    return best_threshold
+        score = float(np.mean(per_slice)) if per_slice else 0.0
+        if score > best_score:
+            best_score = score
+            best_threshold = float(threshold)
 
-def evaluate_model(model, dataloader, global_edge_index, global_edge_type, threshold=0.5):
-    """Evaluate model and return predictions and labels"""
+    return best_threshold, platt
+
+
+def evaluate_model(model, dataloader, global_edge_index, global_edge_type, threshold=0.5, platt=None, return_probs=False):
+    """
+    Evaluate model and return predictions, labels, and slice labels.
+    
+    Args:
+        model: Model to evaluate
+        dataloader: DataLoader for evaluation
+        global_edge_index: Global edge indices for KG
+        global_edge_type: Global edge types for KG
+        threshold: Decision threshold (default: 0.5)
+        platt: Optional dict with 'a' and 'b' for Platt scaling
+        return_probs: If True, return probabilities instead of binary predictions
+        
+    Returns:
+        Tuple of (predictions, labels, slice_labels) or (probs, labels, slice_labels) if return_probs
+    """
     device = get_device()
     model = model.to(device)
     global_edge_index = global_edge_index.to(device)
     global_edge_type = global_edge_type.to(device)
     
     model.eval()
-    all_predictions, all_labels, all_slice_labels = [], [], []
+    all_probs, all_labels, all_slice_labels = [], [], []
     
     with torch.no_grad():
         for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
-            # Move to device
+            # Move batch to device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             entity_ids = entity_ids.to(device)
-            labels = labels.to(device)
             
-            # Create batch dictionary with global graph structure
             batch = {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
@@ -615,15 +672,33 @@ def evaluate_model(model, dataloader, global_edge_index, global_edge_type, thres
                 'edge_type': global_edge_type
             }
             
-            # Forward pass
+            # Get model outputs
             out = model(batch, task='qa')
-            logits = out[0] if isinstance(out, tuple) else out
-            predictions = (torch.sigmoid(logits.squeeze()) > threshold)
-            all_predictions.extend(predictions.detach().cpu().numpy())
-            all_labels.extend(labels.detach().cpu().numpy())
-            all_slice_labels.extend(slice_labels.detach().cpu().numpy())
-
-    return np.array(all_predictions), np.array(all_labels), np.array(all_slice_labels)
+            if isinstance(out, tuple):
+                out = out[0]  # Handle case where model returns (logits, ...)
+                
+            # Apply Platt scaling if provided
+            if platt is not None:
+                a, b = float(platt['a']), float(platt['b'])
+                probs = torch.sigmoid(a * out.view(-1) + b)
+            else:
+                probs = torch.sigmoid(out.view(-1))
+            
+            all_probs.append(probs.cpu())
+            all_labels.append(labels.cpu())
+            all_slice_labels.append(slice_labels.cpu())
+    
+    # Convert to numpy arrays
+    all_probs = torch.cat(all_probs).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    all_slice_labels = torch.cat(all_slice_labels).numpy()
+    
+    if return_probs:
+        return all_probs, all_labels, all_slice_labels
+    
+    # Convert probabilities to binary predictions
+    predictions = (all_probs > threshold).astype(int)
+    return predictions, all_labels, all_slice_labels
 
 def summarize_gates(model, dataloader, edge_index, edge_type):
     """Summarize gate behavior by slice to verify routing with 3-way gating"""
@@ -678,10 +753,21 @@ def summarize_gates(model, dataloader, edge_index, edge_type):
     
     return sums
 
-def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
-    """Run comprehensive complementarity experiments with all model types"""
+def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42, calibrate_thresholds=True):
+    """
+    Run comprehensive complementarity experiments with all model types
+    
+    Args:
+        num_samples: Number of samples to generate
+        num_epochs: Number of training epochs
+        seed: Random seed for reproducibility
+        calibrate_thresholds: Whether to use Platt scaling for calibration
+    """
     set_seeds(seed)
     torch.set_float32_matmul_precision("high")
+    
+    # Track timing for performance analysis
+    start_time = time.time()
     
     print("🚀 Starting Baseline Complementarity Training Experiments")
     print("=" * 60)
@@ -772,23 +858,62 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
                 num_epochs=num_epochs, model_name=model_name
             )
             
-            # Compute optimal threshold on fixed validation data
+            # Find optimal threshold on validation set with optional Platt scaling
             print(f"\n  Computing optimal threshold for {model_name}...")
-            optimal_threshold = compute_optimal_threshold(model, val_dataloader, global_edge_index, global_edge_type, device=get_device())
-            print(f"    Optimal threshold: {optimal_threshold:.3f}")
+            best_threshold, platt_params = compute_optimal_threshold(
+                model=model,
+                dataloader=val_dataloader,
+                global_edge_index=global_edge_index,
+                global_edge_type=global_edge_type,
+                calibrate=calibrate_thresholds
+            )
             
-            # Evaluate models with calibrated threshold
+            # Evaluate on test set with calibrated threshold
             print(f"  Evaluating {model_name}...")
-            predictions, labels, slice_labels = evaluate_model(model, test_dataloader, global_edge_index, global_edge_type, threshold=optimal_threshold)
+            predictions, labels, slice_labels = evaluate_model(
+                model=model,
+                dataloader=test_dataloader,
+                global_edge_index=global_edge_index,
+                global_edge_type=global_edge_type,
+                threshold=best_threshold,
+                platt=platt_params
+            )
+            
+            # Get probabilities for more detailed analysis
+            probs, _, _ = evaluate_model(
+                model=model,
+                dataloader=test_dataloader,
+                global_edge_index=global_edge_index,
+                global_edge_type=global_edge_type,
+                platt=platt_params,
+                return_probs=True
+            )
+            
+            # Calculate metrics
+            accuracy = accuracy_score(labels, predictions)
+            f1 = f1_score(labels, predictions)
+            
+            # Store results with calibration info
+            results[model_key] = {
+                'accuracy': accuracy,
+                'f1': f1,
+                'threshold': best_threshold,
+                'calibration': {
+                    'platt_a': platt_params.get('a', 1.0) if platt_params else 1.0,
+                    'platt_b': platt_params.get('b', 0.0) if platt_params else 0.0,
+                    'calibrated': calibrate_thresholds and platt_params is not None
+                },
+                'predictions': predictions.tolist(),
+                'probabilities': probs.tolist(),
+                'labels': labels.tolist(),
+                'slice_labels': slice_labels.tolist(),
+                'train_metrics': train_results
+            }
             
             # Add gate diagnostics for hierarchical model
             if model_key == 'fusion_hierarchical_gating':
                 print(f"  Gate diagnostics for {model_name}:")
                 summarize_gates(model, val_dataloader, global_edge_index, global_edge_type)
-            
-            # Calculate metrics
-            accuracy = np.mean(predictions == labels)
-            f1 = f1_score(labels, predictions, zero_division=0)
             
             # Count parameters
             total_params = sum(p.numel() for p in model.parameters())
@@ -836,34 +961,26 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
                         }
                         print(f"      - {slice_names[slice_idx]:5s}: n={np.sum(mask):4d} | acc={slice_acc:.3f} | f1={slice_f1:.3f}")
             
-            # Store results with legacy schema compatibility
+            # Store results in a single consolidated format
             results[model_key] = {
-                "status": "success",
-                "model_name": model_name,
-                "accuracy": accuracy,
-                "f1": f1,
-                "predictions": predictions,
-                "labels": labels,
-                "slice_labels": slice_labels,
-                "by_slice": by_slice
-            }
-            results[model_name] = {
-                'accuracy': accuracy,
-                'f1': f1,
-                'predictions': predictions,
-                'labels': labels,
-                'slice_labels': slice_labels,
-                'by_slice': by_slice,
-                'eval_results': {
-                    'accuracy': accuracy,
-                    'f1': f1,
-                    'predictions': predictions,
-                    'labels': labels,
-                    'by_slice': by_slice
+                'status': 'success',
+                'model_name': model_name,
+                'accuracy': float(accuracy),
+                'f1': float(f1),
+                'threshold': float(best_threshold),
+                'calibration': {
+                    'platt_a': platt_params.get('a', 1.0) if platt_params else 1.0,
+                    'platt_b': platt_params.get('b', 0.0) if platt_params else 0.0,
+                    'calibrated': bool(calibrate_thresholds and platt_params is not None)
                 },
+                'predictions': predictions.tolist(),
+                'probabilities': probs.tolist(),
+                'labels': labels.tolist(),
+                'slice_labels': slice_labels.tolist(),
+                'by_slice': by_slice,
                 'training_history': train_results,
-                'threshold': optimal_threshold,
-                'parameters': total_params
+                'parameters': int(total_params),
+                'trainable_parameters': int(trainable_params),
             }
             
         except Exception as e:
@@ -886,24 +1003,87 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
             results[model_key] = fail_payload
             results[model_name] = fail_payload
     
-    # Analyze complementarity
-    print(f"\n🔍 Analyzing Complementarity...")
-    print("-" * 50)
+    # Enhanced complementarity analysis with McNemar tests
+    print(f"\n🔍 Running Enhanced Complementarity Analysis...")
+    print("-" * 60)
     
     successful_models = {k: v for k, v in results.items() if v.get('status') == 'success'}
     
     if len(successful_models) >= 3:  # Need at least dense, kg, and one fusion
+        # Standard complementarity analysis
         complementarity_analysis = analyze_complementarity(successful_models)
         results['complementarity_analysis'] = complementarity_analysis
         
-        print("Complementarity Analysis:")
+        # McNemar test between best fusion and baselines
+        mcnemar_results = {}
+        fusion_models = [k for k in successful_models if k.startswith('fusion_')]
+        
+        if fusion_models and 'dense_only' in successful_models and 'kg_only' in successful_models:
+            # Just compare best fusion vs baselines
+            best_fusion = max(fusion_models, key=lambda k: successful_models[k]['f1'])
+            
+            # Fusion vs Dense
+            result = compute_mcnemar_test(
+                successful_models['dense_only']['predictions'],
+                None,
+                successful_models[best_fusion]['predictions'],
+                successful_models[best_fusion]['labels']
+            )
+            mcnemar_results[f"{best_fusion}_vs_dense"] = result
+            
+            # Fusion vs KG
+            result = compute_mcnemar_test(
+                None,
+                successful_models['kg_only']['predictions'],
+                successful_models[best_fusion]['predictions'],
+                successful_models[best_fusion]['labels']
+            )
+            mcnemar_results[f"{best_fusion}_vs_kg"] = result
+        
+        results['statistical_tests'] = {
+            'mcnemar': mcnemar_results
+        }
+        
+        # Print summary
+        print("\nComplementarity Analysis Summary:")
+        print(f"{'Metric':<30} {'Value':<10} {'Target'}")
+        print("-" * 60)
         for metric, value in complementarity_analysis.items():
             if isinstance(value, float):
-                print(f"  {metric}: {value:.3f}")
+                target = ""
+                if metric == 'gap_closure' and value >= 0.4:
+                    target = "✅ ≥0.40"
+                elif metric == 'both_tnr' and value >= 0.90:
+                    target = "✅ ≥0.90"
+                elif metric == 'kg_slice_acc' and value >= 0.85:
+                    target = "✅ ≥0.85"
+                print(f"  {metric:<30} {value:.3f}     {target}")
+        
+        # Print McNemar results
+        print("\nStatistical Significance (McNemar's Test):")
+        for pair, result in mcnemar_results.items():
+            p = result.get('p_value', result.get('mcnemar_p_value', 1.0))
+            sig = "✅" if p < 0.05 else "❌"
+            print(f"  {pair:<40} p={p:.4f} {sig}")
+            if 'interpretation' in result:
+                print(f"    {result['interpretation']}")
     
-    # Save results
-    results_file = Path('results/experiments/complementarity_baseline_results.json')
-    results_file.parent.mkdir(parents=True, exist_ok=True)
+    # Add experiment metadata
+    results['experiment_metadata'] = {
+        'timestamp': datetime.now().isoformat(),
+        'num_samples': num_samples,
+        'num_epochs': num_epochs,
+        'seed': seed,
+        'calibrated_thresholds': calibrate_thresholds,
+        'total_runtime_seconds': time.time() - start_time,
+        'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
+    }
+    
+    # Save results with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_dir = Path('results/experiments')
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_file = results_dir / f'complementarity_results_{timestamp}.json'
     
     # Convert numpy arrays to lists for JSON serialization
     def convert_numpy_types(obj):
@@ -1043,39 +1223,58 @@ def analyze_gate_diagnostics(results: Dict[str, Dict]):
         both_acc = np.mean(predictions[both_mask] == labels[both_mask])
         print(f"  Fusion effectiveness on 'both' slice: {both_acc:.2f}")
 
-def compute_mcnemar_test(dense_preds, kg_preds, fusion_preds, labels):
-    """Compute McNemar test statistics"""
-    # Convert to numpy arrays
-    dense_preds = np.asarray(dense_preds).astype(int)
-    kg_preds = np.asarray(kg_preds).astype(int)
-    fusion_preds = np.asarray(fusion_preds).astype(int)
-    labels = np.asarray(labels).astype(int)
+def compute_mcnemar_test(dense_preds=None, kg_preds=None, fusion_preds=None, labels=None):
+    """
+    Compute McNemar stats (fusion vs one baseline). Provide either dense_preds or kg_preds.
     
-    # McNemar test: Dense vs Fusion
-    dense_correct = (dense_preds == labels)
-    fusion_correct = (fusion_preds == labels)
-    
-    # Contingency table for McNemar
-    n01 = ((dense_correct == False) & (fusion_correct == True)).sum()  # Dense wrong, Fusion right
-    n10 = ((dense_correct == True) & (fusion_correct == False)).sum()   # Dense right, Fusion wrong
-    
-    # McNemar (exact binomial, two-sided) — no SciPy dependency
-    if n01 + n10 > 0:
-        n = n01 + n10
-        # probability that a Bin(n, 0.5) is at least as extreme as n10
-        tail = sum(comb(n, i) for i in range(min(n01, n10), -1, -1)) * (0.5 ** n)
-        mcnemar_p = min(1.0, 2 * tail)
-    else:
-        mcnemar_p = 1.0
+    Args:
+        dense_preds: Predictions from the dense model (optional)
+        kg_preds: Predictions from the KG model (optional)
+        fusion_preds: Predictions from the fusion model (required)
+        labels: Ground truth labels (required)
         
+    Returns:
+        Dictionary with test statistics including p-value and interpretation
+    """
+    if fusion_preds is None or labels is None:
+        raise ValueError("fusion_preds and labels are required.")
+    baseline_preds = dense_preds if dense_preds is not None else kg_preds
+    if baseline_preds is None:
+        raise ValueError("Provide either dense_preds or kg_preds as baseline.")
+
+    # numpy-ize
+    baseline_preds = np.asarray(baseline_preds).astype(int).ravel()
+    fusion_preds = np.asarray(fusion_preds).astype(int).ravel()
+    labels = np.asarray(labels).astype(int).ravel()
+
+    # correctness
+    b_ok = (baseline_preds == labels)
+    f_ok = (fusion_preds == labels)
+
+    # McNemar counts
+    n01 = int(np.sum((~b_ok) & f_ok))   # baseline wrong, fusion right
+    n10 = int(np.sum(b_ok & (~f_ok)))   # baseline right, fusion wrong
+    n = n01 + n10
+
+    if n == 0:
+        p = 1.0
+    else:
+        # exact two-sided p = 2 * sum_{i=0}^{min(n01,n10)} C(n,i) / 2^n
+        from math import comb
+        m = min(n01, n10)
+        p_tail = sum(comb(n, i) for i in range(0, m + 1)) * (0.5 ** n)
+        p = float(min(1.0, 2 * p_tail))
+
     return {
-        'mcnemar_n01': int(n01),
-        'mcnemar_n10': int(n10), 
-        'mcnemar_p_value': float(mcnemar_p) if mcnemar_p is not None else None
+        "mcnemar_n01": n01,
+        "mcnemar_n10": n10,
+        "mcnemar_p_value": p,
+        "p_value": p,  # alias for convenience
+        "interpretation": f"n01={n01} (baseline wrong, fusion right), n10={n10} (baseline right, fusion wrong)"
     }
 
 def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
-    """Analyze complementarity between Dense and KG models (array-safe guards)."""
+    """Analyze complementarity between Dense and KG models (array-safe) and include McNemar."""
     import numpy as np
 
     def _present_ok(key: str) -> bool:
@@ -1110,6 +1309,9 @@ def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
 
     gap_closures, CIs, f_accs = {}, {}, []
     best_fusion_acc = 0.0
+    best_fusion_key = None
+    best_fusion_preds = None
+    
     for name, r in results.items():
         if name in ('dense_only', 'kg_only') or r.get('status') == 'failed':
             continue
@@ -1119,14 +1321,36 @@ def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
         f_ok = (f == y)
         f_acc = f_ok.mean()
         f_accs.append(f_acc)
-        best_fusion_acc = max(best_fusion_acc, f_acc)
-
+        
+        if f_acc >= best_fusion_acc:
+            best_fusion_acc = f_acc
+            best_fusion_key = name
+            best_fusion_preds = f
         denom = max(oracle_acc - best_single, 1e-9)
-        gap_closures[name] = (f_acc - best_single) / denom
+        # keep gap_closure in [0,1] for reporting
+        gap_closures[name] = max(0.0, min(1.0, (f_acc - best_single) / denom))
         CIs[name] = np.mean(f_ok & (~d_ok) & (~k_ok))
 
     best_gap = max(gap_closures.values()) if gap_closures else 0.0
     avg_gap = float(np.mean(list(gap_closures.values()))) if gap_closures else 0.0
+    
+    # McNemar (exact, two-sided) vs best single
+    if best_fusion_preds is None:
+        mcnemar_p = 1.0
+        n01 = n10 = 0
+    else:
+        best_single_preds = d if dense_acc >= kg_acc else k
+        b_ok = (best_single_preds == y)
+        f_ok = (best_fusion_preds == y)
+        n01 = int(np.sum(b_ok & (~f_ok)))  # best correct, fusion wrong
+        n10 = int(np.sum((~b_ok) & f_ok))  # best wrong, fusion correct
+        n = n01 + n10
+        if n > 0:
+            from math import comb
+            tail = sum(comb(n, i) for i in range(min(n01, n10), -1, -1)) * (0.5 ** n)
+            mcnemar_p = float(min(1.0, 2 * tail))
+        else:
+            mcnemar_p = 1.0
 
     return {
         'dense_accuracy': float(dense_acc),
@@ -1140,6 +1364,10 @@ def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
         'best_fusion_accuracy': float(best_fusion_acc),
         'avg_fusion_accuracy': float(np.mean(f_accs) if f_accs else 0.0),
         'fusion_accuracy': float(best_fusion_acc),
+        'mcnemar_p_value': float(mcnemar_p),
+        'mcnemar_n01': n01,
+        'mcnemar_n10': n10,
+        'best_fusion_key': best_fusion_key or "",
     }
 
 def compute_advanced_metrics(dense_preds, kg_preds, fusion_preds, labels):
