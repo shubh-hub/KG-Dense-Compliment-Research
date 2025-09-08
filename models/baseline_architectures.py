@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv, RGCNConv
 from transformers import AutoModel, AutoTokenizer
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 import math
 
 class DenseVectorEncoder(nn.Module):
@@ -22,10 +22,9 @@ class DenseVectorEncoder(nn.Module):
         self.pooling = pooling  # "cls" | "mean" | "attn"
         
         if freeze_lm:
-            # Freeze language model parameters except last layer for adaptation
-            for name, param in self.encoder.named_parameters():
-                if "layer.5" not in name and "embeddings" not in name:  # Keep last layer + embeddings unfrozen
-                    param.requires_grad = False
+            # Fully freeze the backbone; only train projection/head
+            for _, param in self.encoder.named_parameters():
+                param.requires_grad = False
         
         # Project to desired hidden dimension
         encoder_dim = self.encoder.config.hidden_size
@@ -208,27 +207,28 @@ class CrossAttentionFusion(nn.Module):
         return kg_fused, dense_fused
 
 class HierarchicalGatingFusion(nn.Module):
-    """Hierarchical gating mechanism for adaptive fusion with supervision support"""
-    
-    def __init__(self, hidden_dim: int = 768):
+    """Hierarchical gating mechanism for adaptive fusion with NULL expert support"""
+    def __init__(self, hidden_dim: int = 768, temperature: float = 0.7):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.gate_temp = 0.7  # Temperature for sharper softmax
+        self.gate_temp = max(1e-3, float(temperature))  # Temperature for sharper softmax
         
-        # Gating networks
+        # Gating networks - 3-way: kg, dense, null
         self.gate_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 3)  # kg, dense, null
         )
         self.fusion_layer = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.null_embedding = nn.Parameter(torch.zeros(hidden_dim))
+        nn.init.normal_(self.null_embedding, std=0.02)
         
         # Auxiliary heads for oracle distillation
         self.dense_aux_head = nn.Linear(hidden_dim, 1)
         self.kg_aux_head = nn.Linear(hidden_dim, 1)
         
     def forward(self, kg_embeddings: torch.Tensor, dense_embeddings: torch.Tensor, 
-                return_gates: bool = False, return_aux_logits: bool = False) -> torch.Tensor:
+                return_gates: bool = False, return_aux_logits: bool = False) -> Union[torch.Tensor, tuple]:
         """
         Args:
             kg_embeddings: KG embeddings [batch_size, hidden_dim]
@@ -238,30 +238,31 @@ class HierarchicalGatingFusion(nn.Module):
         Returns:
             Fused embeddings and optionally gates/aux_logits
         """
-        # Compute gates with competitive softmax (not sigmoid+renorm)
+        # Get gate scores
         combined = torch.cat([kg_embeddings, dense_embeddings], dim=-1)
-        gate_logits = self.gate_head(combined)        # Compute gates with temperature-scaled softmax for sharpness
-        gates = F.softmax(gate_logits / self.gate_temp, dim=-1)  # Competitive gating
+        gate_logits = self.gate_head(combined)
+        gates = F.softmax(gate_logits / self.gate_temp, dim=-1)  # [B,3] -> (kg,dense,null)
         
-        # Apply gates
+        # Apply gating with NULL expert
         kg_gated = gates[:, 0:1] * kg_embeddings
         dense_gated = gates[:, 1:2] * dense_embeddings
+        null_gated = gates[:, 2:3] * self.null_embedding.unsqueeze(0)  # broadcast
         
-        # Fuse
-        fused = torch.cat([kg_gated, dense_gated], dim=-1)
+        # Fuse gated representations (NULL expert only affects KG path)
+        fused = torch.cat([kg_gated + null_gated, dense_gated], dim=-1)
         fused_output = self.fusion_layer(fused)
         
-        if return_gates or return_aux_logits:
-            outputs = [fused_output]
-            if return_gates:
-                outputs.extend([gates[:, 0:1], gates[:, 1:2]])
-            if return_aux_logits:
-                kg_aux = self.kg_aux_head(kg_embeddings)
-                dense_aux = self.dense_aux_head(dense_embeddings)
-                outputs.extend([kg_aux, dense_aux])
-            return tuple(outputs)
+        # Optional auxiliary outputs
+        outputs = [fused_output]
+        if return_gates:
+            outputs.extend([gates[:, 0:1], gates[:, 1:2], gates[:, 2:3]])  # kg, dense, null
         
-        return fused_output
+        if return_aux_logits:
+            kg_aux = self.kg_aux_head(kg_embeddings)
+            dense_aux = self.dense_aux_head(dense_embeddings)
+            outputs.extend([kg_aux, dense_aux])
+        
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 class TensorBilinearFusion(nn.Module):
     """Tensor bilinear fusion for complex KG-Dense interactions"""
@@ -420,6 +421,7 @@ class KGDenseFusionModel(nn.Module):
             num_entities=config['num_entities'],
             num_relations=config['num_relations'],
             hidden_dim=config['hidden_dim'],
+            gnn_type=config.get('gnn_type', 'rgcn'),
             num_layers=config.get('gnn_layers', 2),
             num_bases=config.get('num_bases', 16),
             dropout=config.get('dropout', 0.1)
@@ -434,7 +436,8 @@ class KGDenseFusionModel(nn.Module):
             )
         elif fusion_type == 'hierarchical_gating':
             self.fusion = HierarchicalGatingFusion(
-                hidden_dim=config.get('hidden_dim', 768)
+                hidden_dim=config.get('hidden_dim', 768),
+                temperature=config.get('gate_temperature', 0.7)
             )
         elif fusion_type == 'tensor_bilinear':
             self.fusion = TensorBilinearFusion(
@@ -468,63 +471,49 @@ class KGDenseFusionModel(nn.Module):
             nn.Linear(config.get('hidden_dim', 768) * 2, 1)
         )
         
-    def forward(self, batch: Dict[str, torch.Tensor], task: str = 'qa', return_aux_outputs: bool = False) -> torch.Tensor:
-        """
-        Args:
-            batch: Input batch containing text and KG data
-            task: Task type ('qa' or 'ir')
-            return_aux_outputs: Return auxiliary outputs for supervision
-        Returns:
-            Task-specific predictions and optionally auxiliary outputs
-        """
-        # Get embeddings
+    def forward(self, batch: Dict[str, torch.Tensor], task: str = 'qa', return_aux_outputs: bool = False):
+        """Task-agnostic forward. Aux outputs are only produced by hierarchical gating when requested."""
         dense_embeddings = self.dense_encoder(batch['input_ids'], batch['attention_mask'])
         kg_embeddings = self.kg_encoder(batch['entity_ids'], batch['edge_index'], batch.get('edge_type'))
-        
-        # Fusion with auxiliary outputs for hierarchical gating
+        aux_outputs = None
+
         if self.fusion_type == 'cross_attention':
-            # 1) Get token sequence from the text encoder
             dense_seq = self.dense_encoder(batch['input_ids'], batch['attention_mask'], return_sequence=True)  # [B,T,H]
-
-            # 2) Tile the KG vector across tokens (MPS-safe: repeat, not expand)
-            kg_vec = self.kg_encoder(batch['entity_ids'], batch['edge_index'], batch.get('edge_type'))        # [B,H]
             T = dense_seq.size(1)
-            kg_seq = kg_vec.unsqueeze(1).repeat(1, T, 1).contiguous()                                          # [B,T,H]
+            kg_seq = kg_embeddings.unsqueeze(1).repeat(1, T, 1).contiguous()                                   # [B,T,H]
+            kg_fused, dense_fused = self.fusion(kg_seq, dense_seq)
+            fused_embeddings = 0.5 * (kg_fused + dense_fused)
 
-            # 3) Cross-attend both ways (batch_first=True)
-            kg_fused, dense_fused = self.fusion(kg_seq, dense_seq)  # token-level X-attn
-            fused_embeddings = 0.5 * (kg_fused + dense_fused)  # Average both streams
-            aux_outputs = None
-        elif self.fusion_type == 'hierarchical_gating' and return_aux_outputs:
-            # Get gates and auxiliary logits for supervision
-            fused_embeddings, kg_gate, dense_gate, kg_aux, dense_aux = self.fusion(
-                kg_embeddings, dense_embeddings, return_gates=True, return_aux_logits=True
-            )
-            aux_outputs = {
-                'kg_gate': kg_gate,
-                'dense_gate': dense_gate,
-                'kg_aux_logits': kg_aux,
-                'dense_aux_logits': dense_aux
-            }
+        elif self.fusion_type == 'hierarchical_gating':
+            if return_aux_outputs:
+                out = self.fusion(kg_embeddings, dense_embeddings, return_gates=True, return_aux_logits=True)
+                fused_embeddings = out[0]
+                aux_outputs = {}
+                if len(out) >= 4:
+                    aux_outputs['kg_gate'] = out[1]
+                    aux_outputs['dense_gate'] = out[2]
+                    aux_outputs['null_gate'] = out[3]
+                if len(out) >= 6:
+                    aux_outputs['kg_aux_logits'] = out[4]
+                    aux_outputs['dense_aux_logits'] = out[5]
+            else:
+                fused_embeddings = self.fusion(kg_embeddings, dense_embeddings)
+
         else:
+            # tensor_bilinear / contrastive
             fused_embeddings = self.fusion(kg_embeddings, dense_embeddings)
-            aux_outputs = None
-        
-        # Add learned interaction residual (kg * dense) for AND patterns
+
         interaction = self.interaction_head(kg_embeddings * dense_embeddings)
         fused_embeddings = fused_embeddings + interaction
-        
-        # Task-specific heads
+
         if task == 'qa':
             logits = self.qa_head(fused_embeddings)
         elif task == 'ir':
-            # For IR, we need passage embeddings too
             passage_embeddings = batch.get('passage_embeddings', fused_embeddings)
-            combined = torch.cat([fused_embeddings, passage_embeddings], dim=-1)
-            logits = self.ir_head(combined)
+            logits = self.ir_head(torch.cat([fused_embeddings, passage_embeddings], dim=-1))
         else:
             raise ValueError(f"Unsupported task: {task}")
-        
+
         if return_aux_outputs and aux_outputs is not None:
             return logits, aux_outputs
         return logits
@@ -564,12 +553,13 @@ class BaselineModels:
             def __init__(self, config):
                 super().__init__()
                 self.encoder = KnowledgeGraphEncoder(
-                    num_entities=config.get('num_entities', 100000),
-                    num_relations=config.get('num_relations', 1000),
+                    num_entities=config.get('num_entities', 500),
+                    num_relations=config.get('num_relations', 20),
                     hidden_dim=config.get('hidden_dim', 768),
-                    gnn_type=config.get('gnn_type', 'gcn'),
+                    gnn_type=config.get('gnn_type', 'rgcn'),
                     num_layers=config.get('gnn_layers', 2),
-                    num_bases=config.get('num_bases', 16)
+                    num_bases=config.get('num_bases', 16),
+                    dropout=config.get('dropout', 0.1)
                 )
                 self.qa_head = nn.Linear(config.get('hidden_dim', 768), 1)
                 self.ir_head = nn.Linear(config.get('hidden_dim', 768) * 2, 1)
@@ -592,12 +582,19 @@ class BaselineModels:
 # Model configurations for different experiments
 MODEL_CONFIGS = {
     'm1_optimized': {
-        'hidden_dim': 768,
+        'dense_model': 'distilbert-base-uncased',
+        'hidden_dim': 384,
+        'gnn_type': 'rgcn',
+        'gnn_layers': 3,
+        'num_heads': 6,
+        'dropout': 0.1,
+        'fusion_dim': 256,
+        'gate_temperature': 0.5,
         'num_entities': 500,
         'num_relations': 20,
         'num_bases': 16,
-        'gnn_layers': 3,  # Increased from 2
-        'dropout': 0.05,  # Added dropout
+        'freeze_lm': True,
+        'pooling': 'mean',
         'batch_size': 32,
         'learning_rate': 1e-4,
         'max_seq_length': 128
@@ -606,7 +603,7 @@ MODEL_CONFIGS = {
         'dense_model': 'distilbert-base-uncased',
         'hidden_dim': 384,
         'gnn_type': 'gcn',
-        'gnn_layers': 2,
+        'gnn_layers': 3,
         'num_heads': 6,
         'dropout': 0.1,
         'fusion_dim': 256,

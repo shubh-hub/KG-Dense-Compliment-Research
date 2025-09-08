@@ -75,7 +75,7 @@ def get_device():
     else:
         return torch.device('cpu')
 
-def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, num_relations=20, batch_size=32, split_data=True, seed=42):
+def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=500, num_relations=20, batch_size=32, split_data=True, seed=42):
     """
     Create synthetic dataset v2 with learnable complementarity signals
     
@@ -88,10 +88,22 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
     torch.manual_seed(seed)
     device = get_device()
     
-    # Vocabulary setup
-    VOCAB_SIZE = 1000
-    SPECIAL_BIGRAMS = [(100, 101), (102, 103), (104, 105), (106, 107)]  # Dense cues
-    SYNONYM_PAIRS = [(200, 250), (201, 251), (202, 252), (203, 253)]    # Dense synonyms
+    # Vocabulary setup (DistilBERT/bert vocab size = 30522)
+    # Put synthetic bigrams high in the vocab to avoid [CLS]=101 and [SEP]=102 collisions
+    VOCAB_SIZE = 30522
+    BIGRAM_BASE = 29000
+    SPECIAL_BIGRAMS = [
+        (BIGRAM_BASE + 0, BIGRAM_BASE + 1),
+        (BIGRAM_BASE + 2, BIGRAM_BASE + 3),
+        (BIGRAM_BASE + 4, BIGRAM_BASE + 5),
+        (BIGRAM_BASE + 6, BIGRAM_BASE + 7),
+    ]  # 2 positive, 2 negative bigrams
+    SYNONYM_PAIRS = [
+        (BIGRAM_BASE + 8, BIGRAM_BASE + 9),
+        (BIGRAM_BASE + 10, BIGRAM_BASE + 11),
+        (BIGRAM_BASE + 12, BIGRAM_BASE + 13),
+        (BIGRAM_BASE + 14, BIGRAM_BASE + 15)
+    ]  # Dense synonyms
     
     # Create global graph structure (single edge_index for all samples)
     global_edges = []
@@ -126,6 +138,7 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
     # balanced, deterministic subset of "good" entities (~50%)
     rng = random.Random(seed)
     good_entities = rng.sample(range(num_entities), k=num_entities // 2)
+    bad_entities = sorted(set(range(num_entities)) - set(good_entities))
     
     print(f"  Graph edges: {global_edge_index.size(1)}   Relation types: {num_relations}")
     print(f"  Good entities for BOTH slice: {len(good_entities)}")
@@ -151,7 +164,7 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
             attention_mask[0] = 1
             
             # Add bigram tokens based on slice
-            if slice_idx == 0:  # Dense slice
+            if slice_idx == 0:  # Dense slice  ➜ make KG misleading, label from dense cue only
                 # Make dense cue more learnable with 80% positive bias
                 if torch.rand(1).item() < 0.8:
                     bigram_idx = random.choice([0, 2])  # Positive bigrams
@@ -163,8 +176,18 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
                 
                 # Dense cue determines label
                 label = bigram_idx % 2 == 0  # Even indices are positive
+                # Pick entity from "bad" bucket most of the time so KG-only tends to be wrong here
+                if torch.rand(1).item() < 0.8 and bad_entities:
+                    entity_id = random.choice(bad_entities)
+                else:
+                    entity_id = random.randint(0, num_entities - 1)
+                slice_labels.append(0)
+                # Done for dense slice
+                input_ids_list.append(input_ids); attention_mask_list.append(attention_mask)
+                entity_ids_list.append(entity_id); labels_list.append(label)
+                continue
             else:
-                # Fill with random tokens for non-dense slices
+                # Fill with random tokens for non-dense slices (nowhere near special bigrams or [CLS]/[SEP])
                 random_tokens = torch.randint(1000, 5000, (2,))
                 input_ids[1:3] = random_tokens  # After CLS token
                 attention_mask[1:3] = 1
@@ -174,20 +197,17 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
             attention_mask[3] = 1
             
             # Entity selection and labeling based on slice type
-            if slice_idx == 0:  # Dense slice
-                entity_id = random.randint(0, num_entities - 1)
-                slice_labels.append(0)
-                
-            elif slice_idx == 1:  # KG slice  
-                # Make KG slice balanced with 30% positive cue bias
-                KG_POS_BIAS = 0.3  # expected pos rate ~ 0.5 + 0.5*0.3 = 0.65
-                if torch.rand(1).item() < KG_POS_BIAS:
-                    entity_id = random.choice(good_entities)
-                    label = 1.0
+            if slice_idx == 1:  # KG slice  ➜ make Dense misleading, label from KG only
+                # Force a NEGATIVE dense cue (choose a negative bigram)
+                neg_idx = random.choice([1, 3])
+                neg_bigram = SPECIAL_BIGRAMS[neg_idx]
+                input_ids[1:3] = torch.tensor(neg_bigram)
+                attention_mask[1:3] = 1
+                # Choose entity to set label; clearly positive-leaning to make KG learnable
+                if torch.rand(1).item() < 0.80 and good_entities:
+                    entity_id = random.choice(good_entities); label = 1.0
                 else:
-                    entity_id = random.randint(0, num_entities - 1)
-                    label = 1.0 if entity_id in good_entities else 0.0
-                    
+                    entity_id = random.choice(bad_entities if bad_entities else list(range(num_entities))); label = 0.0
                 slice_labels.append(1)
                 
             elif slice_idx == 2:  # BOTH slice - requires both dense AND KG signals (ADVERSARIAL)
@@ -207,9 +227,9 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
                 label = 0.0
                 slice_labels.append(2)
                 
-            else:  # None slice (random baseline)
+            else:  # None slice (neutral baseline)
                 entity_id = random.randint(0, num_entities - 1)
-                # No learnable pattern, random label
+                # Neutral: 50/50 so models can't farm easy negatives
                 label = float(torch.rand(1).item() > 0.5)
                 slice_labels.append(3)
             
@@ -225,6 +245,14 @@ def create_synthetic_dataset_v2(num_samples=1000, seq_len=32, num_entities=100, 
     labels = torch.tensor(labels_list, dtype=torch.float32)
     slice_labels = torch.tensor(slice_labels, dtype=torch.long)
     
+    # Quick sanity: slice positive rates
+    with torch.no_grad():
+        pr = []
+        for s in range(4):
+            m = (slice_labels == s)
+            pr.append(float(labels[m].mean().item()) if m.any() else float('nan'))
+        print(f"  Slice positive rates (dense/kg/both/none): {pr[0]:.2f} / {pr[1]:.2f} / {pr[2]:.2f} / {pr[3]:.2f}")
+
     if split_data:
         # Create stratified 80/10/10 train/val/test split by slice
         dataset = TensorDataset(input_ids, attention_mask, entity_ids, labels, slice_labels)
@@ -296,7 +324,16 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
     global_edge_index = global_edge_index.to(device)
     global_edge_type = global_edge_type.to(device)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    # Different learning rates for KG and other parameters
+    kg_params, other_params = [], []
+    for n, p in model.named_parameters():
+        (kg_params if ("kg_encoder" in n) else other_params).append(p)
+    
+    optimizer = torch.optim.AdamW(
+        [{'params': other_params, 'lr': 1e-4},
+         {'params': kg_params,   'lr': 3e-4}],  # Higher LR for KG
+        weight_decay=0.01
+    )
     criterion = nn.BCEWithLogitsLoss()
     
     # Check if this is a hierarchical gating fusion model
@@ -356,45 +393,48 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
                 loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
                 loss = (loss_vec * slice_weights).mean()
                 
-                # Enforce negative margin on BOTH slice (index 2) - ONLY for fusion models
-                apply_both_margin = 'hierarchical_gating' in model.__class__.__name__.lower() or 'fusion' in model_name.lower()
-                if apply_both_margin:
-                    both_mask = (slice_labels == 2)
-                    if both_mask.any():
-                        both_logits = outputs.squeeze()[both_mask]
-                        margin = 1.0
-                        loss = loss + 0.2 * F.relu(both_logits + margin).mean()
+                # Enforce negative margins on BOTH (2) and NONE (3) for fusion models
+                apply_margins = 'hierarchical_gating' in model.__class__.__name__.lower() or 'fusion' in model_name.lower()
+                if apply_margins:
+                    logits_s = outputs.squeeze()
+                    margin = 2.0  # Stronger margin
+                    coeff = 0.6   # Higher coefficient for margin loss
+                    for bad_slice in (2, 3):  # BOTH and NONE slices
+                        m = (slice_labels == bad_slice)
+                        if m.any():
+                            loss = loss + coeff * F.relu(logits_s[m] + margin).mean()
                 
-                # Gate supervision loss
+                # Gate supervision loss for 3-way gating (kg, dense, null)
                 if aux_outputs is not None:
                     kg_gate = aux_outputs['kg_gate'].squeeze()
                     dense_gate = aux_outputs['dense_gate'].squeeze()
+                    null_gate = aux_outputs.get('null_gate', torch.zeros_like(kg_gate))
                     
-                    # Gate targets based on slice
+                    # Gate targets based on slice (kg, dense, null)
                     kg_target = torch.zeros_like(kg_gate)
                     dense_target = torch.zeros_like(dense_gate)
+                    null_target = torch.zeros_like(null_gate)
                     
                     for i, slice_label in enumerate(slice_labels):
                         if slice_label == 0:  # Dense slice
-                            kg_target[i] = 0.1
-                            dense_target[i] = 0.9
+                            kg_target[i], dense_target[i], null_target[i] = 0.05, 0.90, 0.05
                         elif slice_label == 1:  # KG slice
-                            kg_target[i] = 0.9  # Increased from 0.8
-                            dense_target[i] = 0.1  # Decreased from 0.2
-                        else:  # BOTH or NONE slice
-                            kg_target[i] = 0.5
-                            dense_target[i] = 0.5
+                            kg_target[i], dense_target[i], null_target[i] = 0.90, 0.05, 0.05
+                        else:  # BOTH or NONE slice -> prefer NULL
+                            kg_target[i], dense_target[i], null_target[i] = 0.10, 0.10, 0.80
                     
-                    gate_loss = F.mse_loss(kg_gate, kg_target) + F.mse_loss(dense_gate, dense_target)
-                    loss = loss + 0.6 * gate_loss  # Increased from 0.4 for stronger supervision
+                    gate_loss = (F.mse_loss(kg_gate, kg_target) + 
+                               F.mse_loss(dense_gate, dense_target) +
+                               F.mse_loss(null_gate, null_target))
+                    loss = loss + 0.6 * gate_loss  # Strong gate supervision
                     
                     # Oracle distillation loss
                     if 'kg_aux_logits' in aux_outputs and 'dense_aux_logits' in aux_outputs:
                         kg_aux = aux_outputs['kg_aux_logits'].squeeze()
                         dense_aux = aux_outputs['dense_aux_logits'].squeeze()
                         
-                        oracle_loss = F.binary_cross_entropy_with_logits(kg_aux, labels) + \
-                                     F.binary_cross_entropy_with_logits(dense_aux, labels)
+                        oracle_loss = (F.binary_cross_entropy_with_logits(kg_aux, labels) +
+                                     F.binary_cross_entropy_with_logits(dense_aux, labels))
                         loss = loss + 0.1 * oracle_loss
                     
                     # Entropy regularization for decisive routing
@@ -435,14 +475,16 @@ def train_model(model, train_loader, val_loader, global_edge_index, global_edge_
                 loss_vec = F.binary_cross_entropy_with_logits(outputs.squeeze(), labels, reduction='none')
                 loss = (loss_vec * slice_weights).mean()
                 
-                # Enforce negative margin on BOTH slice (index 2) - ONLY for fusion models
-                apply_both_margin = 'hierarchical_gating' in model.__class__.__name__.lower() or 'fusion' in model_name.lower()
-                if apply_both_margin:
-                    both_mask = (slice_labels == 2)
-                    if both_mask.any():
-                        both_logits = outputs.squeeze()[both_mask]
-                        margin = 1.0
-                        loss = loss + 0.2 * F.relu(both_logits + margin).mean()
+                # Enforce negative margins on BOTH (2) and NONE (3) for fusion models
+                apply_margins = 'hierarchical_gating' in model.__class__.__name__.lower() or 'fusion' in model_name.lower()
+                if apply_margins:
+                    logits_s = outputs.squeeze()
+                    margin = 2.0  # Stronger margin
+                    coeff = 0.6   # Higher coefficient for margin loss
+                    for bad_slice in (2, 3):  # BOTH and NONE slices
+                        m = (slice_labels == bad_slice)
+                        if m.any():
+                            loss = loss + coeff * F.relu(logits_s[m] + margin).mean()
             
             # Backward pass
             loss.backward()
@@ -500,7 +542,8 @@ def compute_optimal_threshold(model, dataloader, global_edge_index, global_edge_
                 'edge_type': global_edge_type
             }
             
-            logits = model(batch)
+            out = model(batch, task='qa')
+            logits = out[0] if isinstance(out, tuple) else out
             probs = torch.sigmoid(logits.squeeze()).cpu().numpy()
             
             all_probs.extend(probs)
@@ -553,9 +596,7 @@ def evaluate_model(model, dataloader, global_edge_index, global_edge_type, thres
     global_edge_type = global_edge_type.to(device)
     
     model.eval()
-    all_predictions = []
-    all_labels = []
-    all_slice_labels = []
+    all_predictions, all_labels, all_slice_labels = [], [], []
     
     with torch.no_grad():
         for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
@@ -575,44 +616,65 @@ def evaluate_model(model, dataloader, global_edge_index, global_edge_type, thres
             }
             
             # Forward pass
-            outputs = model(batch, task='qa')
-            predictions = torch.sigmoid(outputs.squeeze()) > threshold
-            
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_slice_labels.extend(slice_labels.numpy())
-    
+            out = model(batch, task='qa')
+            logits = out[0] if isinstance(out, tuple) else out
+            predictions = (torch.sigmoid(logits.squeeze()) > threshold)
+            all_predictions.extend(predictions.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+            all_slice_labels.extend(slice_labels.detach().cpu().numpy())
+
     return np.array(all_predictions), np.array(all_labels), np.array(all_slice_labels)
 
 def summarize_gates(model, dataloader, edge_index, edge_type):
-    """Summarize gate behavior by slice to verify routing"""
-    device = get_device()
+    """Summarize gate behavior by slice to verify routing with 3-way gating"""
+    device = next(model.parameters()).device
     model.eval()
-    sums = {s: {"kg": 0.0, "dense": 0.0, "n": 0} for s in ["dense", "kg", "both", "none"]}
+    edge_index = edge_index.to(device)
+    edge_type = edge_type.to(device)
+
+    slice_names = {0: 'dense', 1: 'kg', 2: 'both', 3: 'none'}
+    sums = {k: {'kg': 0.0, 'dense': 0.0, 'null': 0.0, 'n': 0} for k in slice_names}
     
     with torch.no_grad():
-        for input_ids, attention_mask, entity_ids, labels, slice_labels in dataloader:
-            batch = {
-                "input_ids": input_ids.to(device),
-                "attention_mask": attention_mask.to(device),
-                "entity_ids": entity_ids.to(device),
-                "edge_index": edge_index.to(device),
-                "edge_type": edge_type.to(device),
-            }
-            _, aux = model(batch, task="qa", return_aux_outputs=True)
-            kg_gate = aux["kg_gate"].squeeze().cpu().numpy()
-            dense_gate = aux["dense_gate"].squeeze().cpu().numpy()
+        for batch in dataloader:
+            input_ids, attention_mask, entity_ids, labels, slice_labels = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            entity_ids = entity_ids.to(device)
             
-            for gk, gd, s in zip(kg_gate, dense_gate, slice_labels.numpy()):
-                k = ["dense", "kg", "both", "none"][int(s)]
-                sums[k]["kg"] += float(gk)
-                sums[k]["dense"] += float(gd)
-                sums[k]["n"] += 1
+            batch = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'entity_ids': entity_ids,
+                'edge_index': edge_index,
+                'edge_type': edge_type
+            }
+            
+            # Get gate values
+            result = model(batch, task='qa', return_aux_outputs=True)
+            if isinstance(result, tuple) and len(result) > 1:
+                _, aux = result
+                kg_gate = aux['kg_gate'].squeeze().cpu().numpy()
+                dense_gate = aux['dense_gate'].squeeze().cpu().numpy()
+                null_gate = aux.get('null_gate', torch.zeros_like(aux['kg_gate'])).squeeze().cpu().numpy()
+                
+                # Update statistics by slice
+                for i, sl in enumerate(slice_labels):
+                    k = sl.item()
+                    sums[k]['kg'] += kg_gate[i]
+                    sums[k]['dense'] += dense_gate[i]
+                    sums[k]['null'] += null_gate[i]
+                    sums[k]['n'] += 1
     
-    print("    Gate diagnostics:")
-    for k, v in sums.items():
-        if v["n"]:
-            print(f"      {k:5s} gates → kg={v['kg']/v['n']:.3f}, dense={v['dense']/v['n']:.3f}  (n={v['n']})")
+    # Print summary
+    print("\nGate Behavior by Slice:")
+    for k, v in sorted(sums.items()):
+        if v['n'] > 0:
+            line = f"  {slice_names[k]:5s} gates → kg={v['kg']/v['n']:.3f}, dense={v['dense']/v['n']:.3f}"
+            if 'null' in v:
+                line += f", null={v['null']/v['n']:.3f}"
+            line += f"  (n={v['n']})"
+            print(line)
     
     return sums
 
@@ -681,12 +743,13 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
                     def __init__(self, config):
                         super().__init__()
                         self.encoder = KnowledgeGraphEncoder(
-                            num_entities=config.get('num_entities', 100000),
-                            num_relations=config.get('num_relations', 1000),
+                            num_entities=config.get('num_entities', 500),
+                            num_relations=config.get('num_relations', 20),
                             hidden_dim=config.get('hidden_dim', 384),
                             gnn_type=config.get('gnn_type', 'rgcn'),
                             num_layers=config.get('gnn_layers', 2),
-                            num_bases=config.get('num_bases', 16)
+                            num_bases=config.get('num_bases', 16),
+                            dropout=config.get('dropout', 0.1)
                         )
                         self.qa_head = nn.Linear(config.get('hidden_dim', 384), 1)
                     
@@ -804,10 +867,11 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
             }
             
         except Exception as e:
-            print(f"  ❌ {model_name}: Failed - {str(e)}")
-            results[model_name] = {
+            err = str(e)
+            print(f"  ❌ {model_name}: Failed - {err}")
+            fail_payload = {
                 'status': 'failed',
-                'error': str(e),
+                'error': err,
                 'f1': 0.0,
                 'accuracy': 0.0,
                 'predictions': [],
@@ -819,6 +883,8 @@ def run_complementarity_experiments(num_samples=1000, num_epochs=3, seed=42):
                 'threshold': 0.5,
                 'parameters': 0
             }
+            results[model_key] = fail_payload
+            results[model_name] = fail_payload
     
     # Analyze complementarity
     print(f"\n🔍 Analyzing Complementarity...")
@@ -993,10 +1059,12 @@ def compute_mcnemar_test(dense_preds, kg_preds, fusion_preds, labels):
     n01 = ((dense_correct == False) & (fusion_correct == True)).sum()  # Dense wrong, Fusion right
     n10 = ((dense_correct == True) & (fusion_correct == False)).sum()   # Dense right, Fusion wrong
     
-    # McNemar test (exact for small samples)
+    # McNemar (exact binomial, two-sided) — no SciPy dependency
     if n01 + n10 > 0:
-        mcnemar_stat = (abs(n01 - n10) - 1) ** 2 / (n01 + n10)
-        mcnemar_p = 1 - chi2.cdf(mcnemar_stat, 1) if n01 + n10 >= 25 else None
+        n = n01 + n10
+        # probability that a Bin(n, 0.5) is at least as extreme as n10
+        tail = sum(comb(n, i) for i in range(min(n01, n10), -1, -1)) * (0.5 ** n)
+        mcnemar_p = min(1.0, 2 * tail)
     else:
         mcnemar_p = 1.0
         
@@ -1007,11 +1075,32 @@ def compute_mcnemar_test(dense_preds, kg_preds, fusion_preds, labels):
     }
 
 def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
-    """Analyze complementarity between Dense and KG models"""
+    """Analyze complementarity between Dense and KG models (array-safe guards)."""
     import numpy as np
-    d = np.asarray(results['dense_only']['predictions']).astype(int)
-    k = np.asarray(results['kg_only']['predictions']).astype(int)
-    y = np.asarray(results['dense_only']['labels']).astype(int)
+
+    def _present_ok(key: str) -> bool:
+        """Check that a model exists, didn't fail, and has non-empty preds/labels (array-safe)."""
+        if key not in results:
+            return False
+        r = results.get(key, {})
+        if r.get('status') == 'failed':
+            return False
+        preds = r.get('predictions', None)
+        labels = r.get('labels', None)
+        if preds is None or labels is None:
+            return False
+        try:
+            return (len(preds) > 0) and (len(labels) > 0)
+        except Exception:
+            return False
+
+    if not (_present_ok('dense_only') and _present_ok('kg_only')):
+        print("  Skipping complementarity analysis (dense_only/kg_only missing or failed)")
+        return {}
+
+    d = np.asarray(results['dense_only']['predictions']).astype(int).ravel()
+    k = np.asarray(results['kg_only']['predictions']).astype(int).ravel()
+    y = np.asarray(results['dense_only']['labels']).astype(int).ravel()
 
     d_ok, k_ok = (d == y), (k == y)
     dense_acc, kg_acc = d_ok.mean(), k_ok.mean()
@@ -1022,11 +1111,11 @@ def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
     gap_closures, CIs, f_accs = {}, {}, []
     best_fusion_acc = 0.0
     for name, r in results.items():
-        if name in ('dense_only','kg_only') or r.get('status') == 'failed':
+        if name in ('dense_only', 'kg_only') or r.get('status') == 'failed':
             continue
-        if 'predictions' not in r:
+        if 'predictions' not in r or 'labels' not in r:
             continue
-        f = np.asarray(r['predictions']).astype(int)
+        f = np.asarray(r['predictions']).astype(int).ravel()
         f_ok = (f == y)
         f_acc = f_ok.mean()
         f_accs.append(f_acc)
@@ -1036,21 +1125,21 @@ def analyze_complementarity(results: Dict[str, Dict]) -> Dict[str, float]:
         gap_closures[name] = (f_acc - best_single) / denom
         CIs[name] = np.mean(f_ok & (~d_ok) & (~k_ok))
 
-    # Compute best and average gap closure
     best_gap = max(gap_closures.values()) if gap_closures else 0.0
     avg_gap = float(np.mean(list(gap_closures.values()))) if gap_closures else 0.0
-    
+
     return {
         'dense_accuracy': float(dense_acc),
         'kg_accuracy': float(kg_acc),
         'oracle_accuracy': float(oracle_acc),
         'best_single_accuracy': float(best_single),
         'best_gap_closure': float(best_gap),
-        'gap_closure': float(avg_gap),  # keep existing 'gap_closure' as avg
+        'gap_closure': float(avg_gap),
         'complementarity_index': float(np.mean(list(CIs.values())) if CIs else 0.0),
         'dense_kg_agreement': float(agree),
         'best_fusion_accuracy': float(best_fusion_acc),
         'avg_fusion_accuracy': float(np.mean(f_accs) if f_accs else 0.0),
+        'fusion_accuracy': float(best_fusion_acc),
     }
 
 def compute_advanced_metrics(dense_preds, kg_preds, fusion_preds, labels):
@@ -1151,7 +1240,7 @@ def print_experiment_summary(results):
         if 'complementarity_analysis' in results:
             ca = results['complementarity_analysis']
             print(f"\n Complementarity Analysis (advanced):")
-            print(f"  Dense acc: {ca.get('dense_accuracy', 0):.3f} | KG acc: {ca.get('kg_accuracy', 0):.3f} | Fusion acc: {ca.get('fusion_accuracy', 0):.3f}")
+            print(f"  Dense acc: {ca.get('dense_accuracy', 0):.3f} | KG acc: {ca.get('kg_accuracy', 0):.3f} | Best fusion acc: {ca.get('best_fusion_accuracy', 0):.3f}")
             print(f"  Oracle accuracy: {ca.get('oracle_accuracy', 0):.3f}")
             print(f"  Gap closure: {ca.get('gap_closure', 0):.3f}  (target ≥ 0.30)")
             print(f"  Complementarity Index: {ca.get('complementarity_index', 0):.3f}  (target ≥ 0.05)")
