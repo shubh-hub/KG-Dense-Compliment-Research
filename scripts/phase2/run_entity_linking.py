@@ -14,14 +14,27 @@ import pickle
 from pathlib import Path
 from typing import List, Dict, Any
 import re
+import unicodedata
 
 import spacy
 from rank_bm25 import BM25Okapi
 from rapidfuzz import process, fuzz
 from tqdm import tqdm
 
+# Unicode normalization for better EL matching
+SMART_QUOTES = {"\u2018":"'", "\u2019":"'", "\u201C":'"', "\u201D":'"'}
+
+def clean_quotes(s): 
+    return s.translate(str.maketrans(SMART_QUOTES))
+
+def strip_accents(s):
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c)!='Mn')
+
 def norm(s: str) -> str:
-    return " ".join(s.lower().split())
+    s = clean_quotes(s)
+    s = strip_accents(s)
+    s = " ".join(s.lower().split())
+    return s
 
 # Entity hygiene filters
 VALID_TYPES = {"PERSON","ORG","GPE","LOC","FAC","EVENT","WORK_OF_ART","PRODUCT","LANGUAGE","NORP"}
@@ -60,17 +73,15 @@ def save_jsonl(items: List[Dict], output_path: str):
 def run_entity_linking(
     samples: List[Dict],
     alias_map: Dict,
-    bm25_index: BM25Okapi,
-    bm25_corpus: List[Dict],
+    bm25_packs: List[Dict],
     nlp,
     top_k_candidates: int = 5,
     disambiguation_threshold: float = 1.0
 ) -> List[Dict]:
     """Run the full entity linking pipeline on a list of samples."""
     
-    # Build qid2idx for fast lookup
-    qid2idx = {row["qid"]: i for i, row in enumerate(bm25_corpus)}
     alias_keys = set(alias_map.keys())
+
     
     processed_samples = []
     
@@ -81,16 +92,21 @@ def run_entity_linking(
             continue
 
         doc = nlp(text)
+        entities = doc.ents
         el_metadata = []
 
-        for ent in doc.ents:
+        for i, ent in enumerate(entities):
             if not good_mention(ent):
                 continue
+            
             mention = ent.text
             m = norm(mention)
             # Add alias normalization
             m = re.sub(r"^(the|a|an)\s+","", m)         # drop articles
-            m = m.replace("'","'")                       # normalize apostrophes
+            
+            # Check if this is the first capitalized entity of priority types
+            is_first_priority = (i == 0 and mention[0].isupper() and 
+                               ent.label_ in {"GPE", "ORG", "WORK_OF_ART", "LOC"})
             
             # 1. Candidate Generation: Exact-then-fuzzy
             candidate_qids = []
@@ -126,13 +142,23 @@ def run_entity_linking(
             query = (mention + " " + text[left:right]).strip()
             tokenized_query = query.split()
 
-            # Get BM25 scores for candidate QIDs
-            doc_scores = bm25_index.get_scores(tokenized_query)
+            # Pre-compute scores for all docs in each pack once
+            pack_scores = []
+            for pack in bm25_packs:
+                pack_scores.append(pack["bm25"].get_scores(tokenized_query))
+
+            # Get BM25 scores for candidate QIDs using the pre-computed scores
             score_list = []
             for qid, _ in candidate_qids:
-                idx = qid2idx.get(qid)
-                if idx is not None:
-                    score_list.append((qid, doc_scores[idx]))
+                best = 0.0
+                for pack, scores in zip(bm25_packs, pack_scores):
+                    idx = pack["qid2idx"].get(qid)
+                    if idx is not None:
+                        sc = scores[idx]
+                        if sc > best:
+                            best = sc
+                if best > 0:
+                    score_list.append((qid, best))
 
             if not score_list:
                 final_qid, best_score = "NIL", 0.0
@@ -141,11 +167,19 @@ def run_entity_linking(
                 best_qid, best_score = score_list[0]
                 second = score_list[1][1] if len(score_list) > 1 else -1e9
                 margin = best_score - second
-                # tighten threshold + margin
-                if best_score < 1.5 or margin < 0.5:
-                    final_qid = "NIL"
+                # tighten threshold + margin (relaxed for first priority entities)
+                if is_first_priority:
+                    # Relaxed thresholds for first capitalized GPE/ORG/WORK_OF_ART/LOC
+                    if best_score < 1.2 or margin < 0.3:
+                        final_qid = "NIL"
+                    else:
+                        final_qid = best_qid
                 else:
-                    final_qid = best_qid
+                    # Standard thresholds
+                    if best_score < 1.5 or margin < 0.5:
+                        final_qid = "NIL"
+                    else:
+                        final_qid = best_qid
 
             el_metadata.append({
                 "mention": mention,
@@ -163,8 +197,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Entity Linking on sample corpus")
     parser.add_argument("--corpus_file", required=True, help="Path to the combined sample corpus file (JSONL)")
     parser.add_argument("--alias_map", default="data/phase2/alias_map.json", help="Path to alias map")
-    parser.add_argument("--bm25_index", default="data/phase2/bm25_index.pkl", help="Path to BM25 index")
-    parser.add_argument("--bm25_corpus", default="data/phase2/entity_corpus.jsonl", help="Path to BM25 corpus")
+    parser.add_argument("--bm25_pkls", default="data/phase2/bm25_U.pkl,data/phase2/bm25_delta.pkl", help="Comma-separated paths to BM25 pickle files")
     parser.add_argument("--out_file", required=True, help="Output file for annotated corpus")
     parser.add_argument("--spacy_model", default="en_core_web_sm", help="spaCy model to use")
     args = parser.parse_args()
@@ -173,10 +206,19 @@ def main():
     samples = load_jsonl(args.corpus_file)
     with open(args.alias_map, 'r') as f:
         alias_map = json.load(f)
-    with open(args.bm25_index, 'rb') as f:
-        bm25_data = pickle.load(f)
-    bm25_index = bm25_data['bm25']
-    bm25_corpus = load_jsonl(args.bm25_corpus)
+    
+    bm25_packs = []
+    print(f"Loading BM25 indices from {args.bm25_pkls}...")
+    for pkl_path in args.bm25_pkls.split(','):
+        print(f"  - Loading {pkl_path}")
+        with open(pkl_path, 'rb') as f:
+            pack = pickle.load(f)
+            # Ensure qid2idx exists for compatibility
+            if "qid2idx" not in pack:
+                print(f"    > Building qid2idx for {pkl_path}")
+                pack["qid2idx"] = {q: i for i, q in enumerate(pack["qids"])}
+            bm25_packs.append(pack)
+    print(f"[INFO] {len(bm25_packs)} BM25 indices loaded.")
     
     print(f"Loading spaCy model: {args.spacy_model}")
     try:
@@ -186,7 +228,7 @@ def main():
         spacy.cli.download(args.spacy_model)
         nlp = spacy.load(args.spacy_model, disable=["tagger","parser","lemmatizer","attribute_ruler"])
 
-    annotated_samples = run_entity_linking(samples, alias_map, bm25_index, bm25_corpus, nlp)
+    annotated_samples = run_entity_linking(samples, alias_map, bm25_packs, nlp)
     
     save_jsonl(annotated_samples, args.out_file)
     print(f"\nEntity linking complete. Saved {len(annotated_samples)} annotated samples to {args.out_file}")

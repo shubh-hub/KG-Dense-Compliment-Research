@@ -1,0 +1,104 @@
+{
+  "phase": "Phase 3: KG-QA Candidate Ranking Improvement",
+  "date": "2025-09-12",
+  "objective": "Improve KG-QA recall and ranking through heavy retrieval and advanced fusion",
+  
+  "inputs": {
+    "routed_dataset": "data/phase3/kgqa_routed_only.jsonl",
+    "kg_graph": "data/phase2/kg_subset_triples_expanded_v2.jsonl",
+    "relation_labels": "data/raw/kg/wikidata5m/wikidata5m_relation.txt",
+    "entity_labels": "data/raw/kg/wikidata5m/wikidata5m_entity.txt",
+    "bm25_indices": ["data/phase2/bm25_U.pkl", "data/phase2/bm25_delta.pkl"],
+    "full_dataset": "data/phase2/annotated_12k_routed_kg_text_walked_v2.jsonl"
+  },
+  
+  "parameters": {
+    "text_retrieval": {
+      "topk": 50,
+      "force_process_all": true
+    },
+    "kg_walker": {
+      "max_hops": 4,
+      "beam": 100,
+      "topk": 50,
+      "allowlist_k": 16,
+      "hop_penalty": 0.8
+    },
+    "lr_reranker": {
+      "train_test_split": 0.7,
+      "random_seed": 42,
+      "features": ["text_norm", "kg_norm", "lexical_overlap", "in_text", "in_kg"],
+      "model": "LogisticRegression",
+      "class_weight": "balanced"
+    }
+  },
+  
+  "results": {
+    "kgqa_subset_1k": {
+      "baseline": {
+        "text_at_20": 0.015,
+        "kg_at_20": 0.095,
+        "fused_heuristic_at_20": 0.090
+      },
+      "improved": {
+        "text_at_50": 0.015,
+        "kg_heavy_at_20": 0.094,
+        "fused_lr_test_at_1": 0.013,
+        "fused_lr_test_at_5": 0.077,
+        "fused_lr_test_at_10": 0.107,
+        "fused_lr_test_at_20": 0.160
+      }
+    },
+    "ablations": {
+      "allowlist_k": {
+        "k0": {"kg_at_10": 0.050, "kg_at_20": 0.091},
+        "k8": {"kg_at_10": 0.050, "kg_at_20": 0.095},
+        "k16": {"kg_at_10": 0.050, "kg_at_20": 0.094}
+      },
+      "text_topk": {
+        "topk20": {"text_at_20": 0.015},
+        "topk50": {"text_at_20": 0.015}
+      },
+      "fusion_methods": {
+        "heuristic_tuned": {"fused_at_20": 0.090},
+        "lr_proper_split": {"fused_test_at_20": 0.130}
+      }
+    },
+    "slice_diagnostics": {
+      "linked_entities": {"n": 942, "recall_at_20": 0.162},
+      "unlinked_entities": {"n": 58, "recall_at_20": 0.017}
+    }
+  },
+  
+  "key_findings": [
+    "LR reranker with binary features ('in_kg', 'in_text') confirms and strengthens 'KG + text > either alone' result, achieving 70% relative improvement over KG-only.",
+    "The 'in_kg' feature has the strongest positive coefficient (+4.61), indicating the model strongly values candidates from the KG walk.",
+    "Pseudo-seed fallback combined with binary features partially recovers the unlinked entity slice, improving recall from 0% to 1.7%.",
+    "Allowlist expansion (k=8→16) shows minimal impact on recall.",
+    "Text retrieval topk increase (20→50) provides no benefit."
+  ],
+  
+  "outputs": {
+    "kgqa_heavy_candidates": "data/phase3/kgqa_heavy_text_walked_k16_pseudoseed.jsonl",
+    "kgqa_lr_reranked": "data/phase3/kgqa_heavy_text_walked_k16_pseudoseed_rerank_lr5bin.jsonl",
+    "full_dataset_fused": "data/phase3/annotated_12k_fused_lr.jsonl"
+  },
+  
+  "scripts": {
+    "text_retrieval": "scripts/phase3/text_retrieve_bm25.py",
+    "kg_walker": "scripts/phase3/kg_walker.py", 
+    "lr_reranker": "scripts/phase3/train_and_rerank.py",
+    "evaluation": "scripts/phase3/eval_recall_at_k.py",
+    "slice_diagnostics": "scripts/phase3/slice_diagnostics.py",
+    "weight_tuning": "scripts/phase3/tune_reranker_weights.py"
+  },
+  
+  "reproduction_commands": [
+    "conda run -n kg-dense python scripts/phase3/text_retrieve_bm25.py --bm25_pkls data/phase2/bm25_U.pkl,data/phase2/bm25_delta.pkl --in_jsonl data/phase3/kgqa_routed_only.jsonl --out_jsonl data/phase3/kgqa_heavy_text.jsonl --topk 50 --force_process_all",
+    "conda run -n kg-dense python scripts/phase3/kg_walker.py --graph_triples data/phase2/kg_subset_triples_expanded_v2.jsonl --relation_txt data/raw/kg/wikidata5m/wikidata5m_relation.txt --in_jsonl data/phase3/kgqa_heavy_text.jsonl --out_jsonl data/phase3/kgqa_heavy_text_walked_k16_pseudoseed.jsonl --max_hops 4 --beam 100 --topk 50 --allowlist_k 16",
+    "conda run -n kg-dense python scripts/phase3/train_and_rerank.py --in_jsonl data/phase3/kgqa_heavy_text_walked_k16_pseudoseed.jsonl --out_jsonl data/phase3/kgqa_heavy_text_walked_k16_pseudoseed_rerank_lr5bin.jsonl --train_frac 0.7 --seed 42",
+    "conda run -n kg-dense python scripts/phase3/slice_diagnostics.py --in_jsonl data/phase3/kgqa_heavy_text_walked_k16_pseudoseed_rerank_lr5bin.jsonl"
+  ],
+  
+  "next_phase": "Phase 4: Lightweight reader for top-k reranking with cross-encoder or small LLM scorer"
+}
