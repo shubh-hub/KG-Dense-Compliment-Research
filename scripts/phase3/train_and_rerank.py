@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import json, argparse, re
+import json, argparse, re, pickle
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from collections import defaultdict
+from tqdm import tqdm
 
 def gold_qid(s):
     return s.get("motif",[None]*5)[-1] if s.get("source")=="kg-qa-generated" else None
@@ -25,6 +26,8 @@ def main():
     ap.add_argument("--entity_labels", default="data/raw/kg/wikidata5m/wikidata5m_entity.txt")
     ap.add_argument("--train_frac", type=float, default=0.7, help="Fraction of samples for training")
     ap.add_argument("--seed", type=int, default=42, help="Random seed for train/test split")
+    ap.add_argument("--save_model_pkl", help="Path to save the trained model")
+    ap.add_argument("--load_model_pkl", help="Path to load a pre-trained model")
     args=ap.parse_args()
     qid2label=load_labels(args.entity_labels)
 
@@ -82,11 +85,20 @@ def main():
             X_train.append(features)
             y_train.append(1 if qid == g else 0)
 
-    # 2. Train Logistic Regression model
-    print(f"Training Logistic Regression on {len(X_train)} candidates...")
-    model = LogisticRegression(class_weight='balanced', solver='liblinear')
-    model.fit(X_train, y_train)
-    print("Model trained. Coefficients:", model.coef_)
+    # 2. Train or load Logistic Regression model
+    if args.load_model_pkl:
+        print(f"Loading pre-trained model from {args.load_model_pkl}...")
+        with open(args.load_model_pkl, 'rb') as f:
+            model = pickle.load(f)
+    else:
+        print(f"Training Logistic Regression on {len(X_train)} candidates...")
+        model = LogisticRegression(class_weight='balanced', solver='liblinear')
+        model.fit(X_train, y_train)
+        print("Model trained. Coefficients:", model.coef_)
+        if args.save_model_pkl:
+            print(f"Saving model to {args.save_model_pkl}...")
+            with open(args.save_model_pkl, 'wb') as f:
+                pickle.dump(model, f)
 
     # 3. Evaluate on test set
     def evaluate_recall(samples_to_eval, model, qid2label):
@@ -136,8 +148,8 @@ def main():
     print(f"Test Recall: @1={test_recall[1]:.3f}, @5={test_recall[5]:.3f}, @10={test_recall[10]:.3f}, @20={test_recall[20]:.3f}")
 
     # 4. Rerank and write output
-    with open(args.out_jsonl, "w", encoding="utf-8") as out:
-        for s in samples:
+    with open(args.out_jsonl, "w", encoding="utf-8") as f:
+        for s in tqdm(samples, desc="Reranking all samples"):
             T=s.get("text_candidates") or []
             K=s.get("kg_candidates") or []
             
@@ -168,7 +180,7 @@ def main():
                 fused_scores = {qid: prob for qid, prob in zip(all_qids, probabilities)}
                 s["fused_candidates"] = sorted([{"qid": q, "score": s} for q, s in fused_scores.items()], key=lambda x: x['score'], reverse=True)[:20]
 
-            out.write(json.dumps(s, ensure_ascii=False) + "\n")
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     print(f"Wrote reranked output to {args.out_jsonl}")
 

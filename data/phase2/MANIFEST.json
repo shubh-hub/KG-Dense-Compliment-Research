@@ -1,0 +1,8 @@
+{
+  "corpus": "data/phase2/annotated_12k_sliced_v5.jsonl",
+  "kg_graph": "data/phase2/kg_subset_graph_expanded.json",
+  "alias_map": "data/phase2/alias_map_merged.json",
+  "bm25_index": "data/phase2/bm25_U.pkl",
+  "bm25_corpus": "data/phase2/entity_corpus_U.jsonl",
+  "notes": "EL v5 with expanded KG-U resources; slices computed with label_slices_v2."
+}

@@ -13,7 +13,9 @@ def main():
     with open(args.in_jsonl, 'r', encoding='utf-8') as f_in, open(args.out_jsonl, 'w', encoding='utf-8') as f_out:
         for line in tqdm(f_in, desc="Finding unlinked samples"):
             sample = json.loads(line)
-            if not sample.get("el_results"):
+            el_metadata = sample.get("el_metadata", [])
+            has_link = any(m.get("qid") not in (None, "NIL") and m.get("score", 0) > 0 for m in el_metadata)
+            if not has_link:
                 f_out.write(line)
                 count += 1
 

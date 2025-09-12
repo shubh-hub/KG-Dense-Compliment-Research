@@ -8,6 +8,7 @@ def norm(text):
     text = re.sub(r"[^a-z0-9 ]+"," ", text.lower())
     return re.sub(r"\s+"," ", text).strip()
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bm25_pkls", default="data/phase2/bm25_U.pkl,data/phase2/bm25_delta.pkl")
@@ -35,20 +36,16 @@ def main():
             idx = idx[np.argsort(scores[idx])[::-1]]
         return [(P["qids"][j], float(scores[j])) for j in idx]
 
-    # Count total lines for tqdm if no limit
-    total_lines = args.limit
-    if not total_lines:
-        print("[INFO] Counting total lines in input file for progress bar...")
-        with open(args.in_jsonl, 'r', encoding='utf-8') as f_count:
-            total_lines = sum(1 for _ in f_count)
-
-    with open(args.out_jsonl, "w", encoding="utf-8") as out, open(args.in_jsonl, encoding="utf-8") as f_in:
-        it = tqdm(f_in, total=total_lines, desc="BM25 Retrieval")
-        processed_count = 0
-        for i, ln in enumerate(it):
+    with open(args.in_jsonl, 'r', encoding='utf-8-sig') as f_in, open(args.out_jsonl, "w", encoding="utf-8") as out:
+        for i, ln in enumerate(tqdm(f_in, desc="BM25 Retrieval")):
             if args.limit and i >= args.limit: break
-            s = json.loads(ln)
-            s.pop("kg_candidates", None) # Drop old candidates to prevent format issues
+            if not ln.strip(): continue
+            try:
+                s = json.loads(ln)
+            except json.JSONDecodeError:
+                print(f"[WARN] Skipping invalid JSON on line {i+1}")
+                continue
+
             if args.force_process_all or s.get("route_v1") in ("Dense","Both"):
                 q = s.get("text") or s.get("question","")
                 toks = norm(q).split()
@@ -61,10 +58,8 @@ def main():
                 
                 top = sorted(cand.items(), key=lambda x: x[1], reverse=True)[:args.topk]
                 s["text_candidates"] = [{"qid": qid, "score": float(sc)} for qid, sc in top]
-                processed_count += 1
             out.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     print(f"\n[INFO] Text retrieval complete. Output written to {args.out_jsonl}")
-    print(f"[INFO] Total samples processed for text retrieval: {processed_count}/{total_lines}")
 if __name__ == "__main__":
     main()

@@ -2,13 +2,18 @@
 import json, argparse, re
 from collections import defaultdict, Counter, deque
 from pathlib import Path
+from tqdm import tqdm
 
 def load_graph(triples_jsonl):
     adj = defaultdict(list)   # h -> [(r,t)]
     rel_freq = Counter()
-    with open(triples_jsonl, encoding="utf-8") as f:
+    with open(triples_jsonl, encoding="utf-8-sig") as f:
         for ln in f:
-            o = json.loads(ln)
+            if not ln.strip(): continue
+            try:
+                o = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
             h, r, t = o["head"], o["relation"], o["tail"]
             adj[h].append((r,t))
             rel_freq[r]+=1
@@ -35,23 +40,28 @@ def rel_allowlist(question, rel_map, k):
             allow.append(r)
     return set(allow[:k])
 
-def seeds_from_el(sample, min_score=2.0, max_seeds=5):
-    seeds = [m["qid"] for m in sample.get("el_metadata", [])
-             if m.get("qid") != "NIL" and m.get("score", 0) >= min_score]
-    
-    # For KG-QA questions, always prepend motif[0] as seed
+def seeds_from_el(sample, adj, min_score=2.0, max_seeds=5):
+    seeds = set()
+
+    # 1. Add high-confidence EL seeds.
+    for m in sample.get("el_metadata", []):
+        if m.get("qid") != "NIL" and m.get("score", 0) >= min_score:
+            seeds.add(m["qid"])
+
+    # 2. For gold samples, ALWAYS add the ground-truth motif seed.
     if sample.get("source") == "kg-qa-generated":
         motif = sample.get("motif", [])
-        if motif and motif[0] not in seeds:
-            seeds.insert(0, motif[0])
-    
-    # Pseudo-seed fallback: if no EL seeds, use top-1 BM25 candidate
+        if motif and motif[0]:
+            seeds.add(motif[0])
+
+    # 3. If we still have no seeds, fall back to the best text candidate.
     if not seeds:
         text_candidates = sample.get("text_candidates", [])
         if text_candidates:
-            seeds = [text_candidates[0]["qid"]]
-    
-    return seeds[:max_seeds]
+            if text_candidates[0].get("qid"):
+                seeds.add(text_candidates[0]["qid"])
+
+    return list(seeds)[:max_seeds]
 
 def walk(adj, rel_prior, seeds, allowlist, max_hops=3, beam=20, hop_penalty=0.8):
     # beam over frontier: (score, node, path) where path=[(r,next)]
@@ -79,10 +89,13 @@ def walk(adj, rel_prior, seeds, allowlist, max_hops=3, beam=20, hop_penalty=0.8)
                     _, best_h = candidates[t]
                     candidates[t] = (sc, min(best_h, hop))
                     new_frontier.append((sc, t, path + [(r, t)]))
-            # beam search
-            new_frontier.sort(key=lambda x: x[0], reverse=True)
-            frontier = new_frontier[:beam]
-    return {qid: {"score": sc, "hop": h} for qid, (sc, h) in candidates.items()}  # dict qid->score
+        # beam search after expanding all nodes at this hop
+        new_frontier.sort(key=lambda x: x[0], reverse=True)
+        frontier = new_frontier[:beam]
+    # Filter out seeds from the final candidates
+    seed_qids = {s for s in seeds}
+    final_candidates = {qid: {"score": sc, "hop": h} for qid, (sc, h) in candidates.items() if qid not in seed_qids}
+    return final_candidates
 
 def main():
     ap = argparse.ArgumentParser()
@@ -95,26 +108,82 @@ def main():
     ap.add_argument("--hop_penalty", type=float, default=0.8)
     ap.add_argument("--topk", type=int, default=20)
     ap.add_argument("--allowlist_k", type=int, default=8, help="Size of relation allowlist")
+    ap.add_argument("--expect_min_total", type=int, default=0, help="Fail if total output rows < this number (catches truncated inputs).")
+    ap.add_argument("--expect_min_gold", type=int, default=0, help="Fail if gold rows < this number.")
+    ap.add_argument("--min_gold_kg_cov", type=float, default=0.60, help="Fail if gold rows with kg_candidates < this fraction.")
     args = ap.parse_args()
 
     adj, rel_prior = load_graph(args.graph_triples)
     rel_map = load_relation_map(args.relation_txt)
-    out = open(args.out_jsonl,"w",encoding="utf-8")
-    with open(args.in_jsonl, encoding="utf-8") as f:
-        for ln in f:
+    with open(args.in_jsonl, 'r', encoding='utf-8-sig') as f_in:
+        total_lines = sum(1 for _ in f_in)
+        f_in.seek(0)
+
+    with open(args.in_jsonl, encoding="utf-8-sig") as f_in, open(args.out_jsonl, "w", encoding="utf-8") as f_out:
+        for ln_no, ln in enumerate(tqdm(f_in, total=total_lines, desc="KG Walker"), 1):
             if not ln.strip():
                 continue
-            s = json.loads(ln)
-            if s.get("route_v1") in ("KG","Both"):
-                seeds = seeds_from_el(s)
+            try:
+                s = json.loads(ln)
+            except json.JSONDecodeError as e:
+                print(f"[WARN] Skipping bad JSON at line {ln_no}: {e}")
+                continue
+            # Determine if we should run the walker.
+            # We run if the sample is routed to KG/Both, is a gold sample, or has seeds,
+            # BUT ONLY IF it doesn't already have kg_candidates.
+            # This prevents destructively overwriting good, pre-computed candidates.
+            has_existing_kg_cands = bool(s.get("kg_candidates"))
+            needs_walking = (
+                s.get("route_v1") in ("KG","Both")
+                or s.get("source") == "kg-qa-generated"
+                or any(m.get("qid") not in (None,"NIL") and m.get("score",0) >= 2.0 for m in s.get("el_metadata", []))
+                or (s.get("text_candidates") not in (None, []))
+            )
+
+            should_walk = needs_walking and not has_existing_kg_cands
+            if should_walk:
+                seeds = seeds_from_el(s, adj)
                 question_text = s.get("text") or s.get("question", "")
                 allow = rel_allowlist(question_text, rel_map, args.allowlist_k)
                 cand = walk(adj, rel_prior, seeds, allow, args.max_hops, args.beam, args.hop_penalty) if seeds else {}
-                # keep topk
                 top = sorted(cand.items(), key=lambda x: x[1]["score"], reverse=True)[:args.topk]
                 s["kg_candidates"] = [{"qid": q, "score": v["score"], "hop": v["hop"]} for q,v in top]
-            out.write(json.dumps(s, ensure_ascii=False)+"\n")
-    out.close()
+            else:
+                s.setdefault("kg_candidates", [])  # do NOT overwrite to []
+            f_out.write(json.dumps(s, ensure_ascii=False)+"\n")
     print(f"KG walker done → {args.out_jsonl}")
+
+    # --- Quick sanity audit ---
+    print("\n[INFO] Running post-run sanity check...")
+    tot=gold=gt=gk=gb=0
+    with open(args.out_jsonl, encoding="utf-8-sig") as fh:
+        for ln in fh:
+            if not ln.strip(): continue
+            s=json.loads(ln)
+            tot+=1
+            if s.get("source")=="kg-qa-generated":
+                gold+=1
+                if s.get("text_candidates"): gt+=1
+                if s.get("kg_candidates"):   gk+=1
+                if s.get("text_candidates") and s.get("kg_candidates"): gb+=1
+    print(f"[AUDIT] total={tot} gold={gold} gold_with_text={gt} gold_with_kg={gk} gold_with_both={gb}")
+    
+    if total_lines != tot:
+        print(f"[FATAL] Input line count ({total_lines}) does not match output line count ({tot}). Aborting.")
+        raise SystemExit(1)
+
+    if args.expect_min_total and tot < args.expect_min_total:
+        raise SystemExit(f"[FATAL] Total rows {tot} < expect_min_total={args.expect_min_total}")
+
+    if args.expect_min_gold and gold < args.expect_min_gold:
+        raise SystemExit(f"[FATAL] Gold rows {gold} < expect_min_gold={args.expect_min_gold}")
+
+    if gold and (gk / gold) < args.min_gold_kg_cov:
+        raise SystemExit(
+            f"[FATAL] KG coverage on gold ({gk}/{gold} = {gk/gold:.1%}) "
+            f"< min_gold_kg_cov={args.min_gold_kg_cov:.0%}"
+        )
+    
+    print("[INFO] Sanity check passed.")
 if __name__ == "__main__":
     main()
