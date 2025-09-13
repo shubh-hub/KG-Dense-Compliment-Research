@@ -21,6 +21,17 @@ This document records the baseline performance metrics for the `phase3_base_v6_t
 | `gap_closure` | 37.5%     |
 | `CI` (approx) | 0.3%      |
 
+### Ranking-Based Metrics
+
+While recall@20 measures set membership, ranking metrics like Mean Reciprocal Rank (MRR) and Normalized Discounted Cumulative Gain (NDCG) evaluate the model's ability to place correct answers higher in the list. These metrics provide a more nuanced view of the reranker's contribution.
+
+| Metric      | Fused Model | KG Baseline | Improvement |
+|-------------|-------------|-------------|-------------|
+| **MRR@20**  | 0.027       | 0.016       | **+74%**    |
+| **NDCG@20** | 0.043       | 0.033       | **+30%**    |
+
+**Conclusion**: The fused model demonstrates a substantial improvement in ranking quality over the KG baseline, confirming that the reranker adds significant value by promoting correct candidates, even when the overall recall improvement is modest.
+
 ## Statistical Significance
 
 A McNemar test was performed to compare the fused model against the stronger of the two single-modality baselines (KG). The test evaluates whether there is a significant difference in their classification of whether the correct answer is in the top 20 candidates.
@@ -32,3 +43,15 @@ A McNemar test was performed to compare the fused model against the stronger of 
 - **p-value**: 0.375
 
 **Conclusion**: The result (p=0.375) is not statistically significant at the p < 0.05 level. This suggests that while the fused model shows a small improvement in recall, the difference is not large enough to be considered statistically meaningful given the sample size.
+
+### Per-Slice Significance Analysis
+
+To investigate whether complementarity is more pronounced on specific data slices, McNemar tests were also run on the `bridge`, `kg`, and `dense` slices individually.
+
+| Slice    | n (samples) | n01 (Fused Wins) | n10 (KG Wins) | p-value |
+|----------|-------------|------------------|---------------|---------|
+| `bridge` | 863         | 1                | 0             | 1.0     |
+| `kg`     | 1018        | 2                | 1             | 1.0     |
+| `dense`  | 10119       | 1                | 0             | 1.0     |
+
+**Conclusion**: No statistical significance was found on any individual slice. The number of disagreements remains too low to detect a significant effect, even on the `bridge` slice where hybrid performance is expected to be strongest. This further reinforces that the primary bottleneck is the lack of unique, correct candidates from the retrieval stage.
