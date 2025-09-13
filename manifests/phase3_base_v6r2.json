@@ -1,0 +1,39 @@
+{
+  "name": "phase3_base_v6_textfix_r2",
+  "date": "2025-09-14",
+  "data": {
+    "path": "data/phase3/annotated_12k_walked_final_v6_textfix_r2.jsonl",
+    "shasum256": "95916befbbd5964081d775b33e62ead5d09d69ac02db78b4298be0ddeccf0174"
+  },
+  "fused": {
+    "path": "data/phase3/annotated_12k_fused_lr5bin_v6_textfix_r2_final.jsonl",
+    "shasum256": "0822f02bce2ccecdc0f0638f67c7529becf4b216a90d94f964779a05ee19b3a2"
+  },
+  "model": {
+    "path": "data/phase3/lr5bin_v6_textfix_r2.pkl",
+    "shasum256": "167bb86471e5e385fb91c1c95d1b3a0d270d9a7bb2a13ae8db39a895c37d0e7b"
+  },
+  "bm25": [
+    {
+      "path": "data/phase2/bm25_U.pkl",
+      "shasum256": "e739608e3f8dff7c3cc698cac01b6e8f816a4416fbcd3b80d23fcd132f70cc80"
+    },
+    {
+      "path": "data/phase2/bm25_delta.pkl",
+      "shasum256": "e6294db57477a2eada2f10b8c72511a290eaaadc2bf494bd50e0b4d4f153e12f"
+    }
+  ],
+  "kg": {
+    "triples": {
+      "path": "data/phase2/kg_subset_triples_expanded_v2.jsonl",
+      "shasum256": "bed048cb6010eb498a1a182a8f487e5454107f3d8a896829214541f442beb04b"
+    },
+    "relations": {
+      "path": "data/raw/kg/wikidata5m/wikidata5m_relation.txt",
+      "shasum256": "dfe6e647a9a57a1e58ea1f9dfd73b3a91d3fdb43bf44599d8c586aa2ae0a79be"
+    }
+  },
+  "router_budget": {"text_topk": 20, "kg_topk": 20},
+  "walker": {"beam": 100, "max_hops": 4, "hop_penalty": 0.8, "allowlist_k": 16},
+  "git": {"commit": "2067c94955edc14b1b600efd16428ecc16df228a", "branch": "phase3"}
+}
