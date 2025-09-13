@@ -19,7 +19,7 @@ This document records the baseline performance metrics for the `phase3_base_v6_t
 | `oracle@20`   | 10.4%     |
 | `fused@20`    | 9.9%      |
 | `gap_closure` | 37.5%     |
-| `CI` (approx) | 0.3%      |
+| `CI` (exact)  | 0.0%      |
 
 ### Ranking-Based Metrics
 
@@ -30,7 +30,19 @@ While recall@20 measures set membership, ranking metrics like Mean Reciprocal Ra
 | **MRR@20**  | 0.027       | 0.016       | **+74%**    |
 | **NDCG@20** | 0.043       | 0.033       | **+30%**    |
 
-**Conclusion**: The fused model demonstrates a substantial improvement in ranking quality over the KG baseline, confirming that the reranker adds significant value by promoting correct candidates, even when the overall recall improvement is modest.
+**Conclusion**: The fused model demonstrates a substantial improvement in ranking quality over the KG baseline. An approximate randomization test confirms this improvement is statistically significant (p ≈ 0.0004), indicating the reranker adds real value by promoting correct candidates.
+
+### Independence Gap
+
+The independence gap measures the difference between the observed union recall (`oracle@20`) and the recall expected if the two retrieval systems were statistically independent. A negative gap indicates that the two systems tend to succeed on the same queries.
+
+- **P(Text Correct)**: 1.5%
+- **P(KG Correct)**: 9.6%
+- **Expected Union (if independent)**: 1.5% + 9.6% - (1.5% * 9.6%) = 10.96%
+- **Observed Union (`oracle@20`)**: 10.4%
+- **Independence Gap**: 10.4% - 10.96% = **-0.56%**
+
+**Conclusion**: The negative independence gap suggests a slight overlap in the retrieval successes of the text and KG systems. They are not finding entirely separate sets of correct answers, which helps explain the low exact Complementarity Index.
 
 ## Statistical Significance
 
