@@ -1,0 +1,46 @@
+{
+  "base": "manifests/phase3_base_v6r2.json",
+  "phase2_5": {
+    "walker_script": "scripts/phase3/kg_walker.py",
+    "params": {
+      "beam": 200,
+      "max_hops": 4,
+      "hop_penalty": 0.8,
+      "allowlist_k": 16,
+      "struct_allow_k_per_seed": 2,
+      "allowlist_cap": 64,
+      "type_fit_penalty": 1.0,
+      "text_seed_topk": 5
+    },
+    "reranker": {
+      "script": "scripts/phase3/train_and_rerank.py",
+      "model_path": "data/phase3/lr_robust_v1.pkl",
+      "model_sha256": "43d14606f34d122495b0b5d7de5bdeec966ba569d0c5e596ce3b6d3fac418515",
+      "policy": "rerank",
+      "monotone_guard": true
+    },
+    "priors": {
+      "entity_types": "data/phase2/type/entity_types.json",
+      "rel_type_prior": "data/phase2/type/rel_type_prior.json"
+    },
+    "inputs": {
+      "graph_triples": "data/phase2/kg_subset_triples_expanded_v2.jsonl",
+      "relation_txt": "data/raw/kg/wikidata5m/wikidata5m_relation.txt",
+      "dataset_in": "data/phase3/annotated_12k_to_walk_phase2_5.jsonl"
+    },
+    "repro_commands": {
+      "walk": "conda run -n kg-dense python scripts/phase3/kg_walker.py --in_jsonl data/phase3/annotated_12k_to_walk_phase2_5.jsonl --out_jsonl data/phase3/annotated_12k_walked_fallback_k16_b200_h4.jsonl --beam 200 --max_hops 4 --hop_penalty 0.8 --allowlist_k 16 --struct_allow_k_per_seed 2 --allowlist_cap 64 --type_fit_penalty 1.0 --text_seed_topk 5",
+      "fuse": "conda run -n kg-dense python scripts/phase3/train_and_rerank.py --in_jsonl data/phase3/annotated_12k_walked_fallback_k16_b200_h4.jsonl --out_jsonl data/phase3/annotated_12k_fused_fallback_rerank_guarded.jsonl --load_model_pkl data/phase3/lr_robust_v1.pkl --train_frac 0 --monotone_guard"
+    },
+    "outputs": {
+      "walked": {
+        "path": "data/phase3/annotated_12k_walked_fallback_k16_b200_h4.jsonl",
+        "sha256": "3a4738bf73f98993356a118400e46ed1e39b0e4fd78aa2812c12d6a9d32a2422"
+      },
+      "fused": {
+        "path": "data/phase3/annotated_12k_fused_fallback_rerank_guarded.jsonl",
+        "sha256": "7171218eaa4665654bc3824a9e3078957068132c2a6c4a44fc87644b85e0a5a4"
+      }
+    }
+  }
+}
