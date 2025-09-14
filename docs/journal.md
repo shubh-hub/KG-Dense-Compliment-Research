@@ -4,7 +4,7 @@
 **Principal Investigator**: Research Team  
 **Platform**: Apple M1 MacBook Air (8-core CPU, 8-core GPU, 16GB Unified Memory)  
 **Timeline**: September 2024 - Ongoing  
-**Status**: Phase 2 Complete - Baseline Experiments Validated  
+**Status**: Phase 2.5 partially Complete - KG Walker Optimized & Guarded (Cross Encoder and KGE with priors remaining) Reranker Locked  
 **Target Venues**: NeurIPS 2024, ICML 2025, ICLR 2025  
 
 ## Executive Summary
@@ -655,6 +655,48 @@ All project assets, including data files, models, and code versions, were formal
 - **Stable Baseline**: A robust, well-documented, and reproducible baseline is now established for Phase 3, enabling future experiments to be reliably compared against it.
 
 
+## Phase 2.5: KG Walker Optimization & Guarded Reranking (Completed)
+
+Following the baseline lockdown, this phase focused on systematically improving the two core components of the fusion pipeline: the KG candidate generator (walker) and the fusion reranker. The objective was to break through the performance ceiling identified in Phase 3.5.
+
+### 6.1 KG Walker Performance Overhaul
+
+Initial analysis showed the KG walker's recall (`kg@20` = 9.6%) was the primary performance bottleneck. A series of targeted optimizations were implemented to address this.
+
+-   **Fallback Mechanism**: Implemented a fallback to simpler path queries when the main walker failed to find candidates, improving robustness.
+-   **Soft Allowlisting**: Introduced a "soft allowlist" to supplement the strict entity-linked seeds, allowing the walker to explore promising paths from high-quality text-based seeds.
+-   **Hyperparameter Tuning**: Systematically tuned key parameters, including `beam size`, `max_hops`, and `hop_penalty`.
+
+**Result**: These optimizations led to a significant improvement in KG retrieval performance.
+-   `kg@20`: 9.6% → **13.6%** (A 41% relative improvement).
+
+### 6.2 Robust Reranker with Monotone Guard
+
+With a stronger KG baseline, the focus shifted to creating a fusion model that could safely leverage text candidates without risking performance degradation.
+
+#### 6.2.1 Robust Logistic Regression Reranker
+
+-   **Action**: A logistic regression reranker (`lr_robust_v1.pkl`) was developed with a rich feature set, including normalized scores, lexical overlap, and KG-specific telemetry (e.g., hop distance, allowlist metadata).
+-   **Reproducibility**: A fixed feature map was saved with the model to ensure consistent feature ordering between training and inference.
+
+#### 6.2.2 Post-Rerank Monotone Guard
+
+-   **Problem**: Initial attempts at a `monotone_union` fusion policy were found to be fundamentally flawed for fixed-K lists, as inserting text candidates could inadvertently push better-ranked KG candidates out of the top-K list.
+-   **Solution**: A `apply_monotone_guard` function was implemented as a post-processing step. This guard ensures that all top-K KG candidates are present in the final fused list, preserving the KG recall floor while allowing the reranker to improve the ordering.
+
+### 6.3 Final Performance and Release
+
+The final guarded reranker was evaluated, confirming its effectiveness.
+
+-   **Final Metrics**:
+    -   `kg@20`: 13.6%
+    -   `fused@20`: **13.8%** (Guard successful)
+    -   `MRR@20`: **0.0620** (vs. 0.0174 for KG-only)
+    -   `NDCG@20`: **0.0794** (vs. 0.0417 for KG-only)
+-   **Reproducibility**: A final manifest, `manifests/phase2_5_fallback_k16_guarded.json`, was created, documenting all parameters, artifact checksums, and the exact commands required for reproduction.
+
+**Conclusion**: This phase successfully delivered a high-performance, stable, and reproducible reranking pipeline, ready for further experimentation.
+
 ## Conclusion
 
 We have successfully completed Phase 1 (Infrastructure & Data Setup), Phase 2 (Model Architecture Development), and Phase 4 (Critical Bug Fixes and Statistical Validation) of our KG + Dense Vector complementarity research. The baseline experiments demonstrate clear complementarity patterns with fusion models achieving measurable improvements over individual baselines, now with robust statistical validation.
@@ -673,6 +715,6 @@ We have successfully completed Phase 1 (Infrastructure & Data Setup), Phase 2 (M
 
 ---
 
-*Last Updated: September 9, 2024*  
+*Last Updated: September 15, 2025*  
 *Platform: Apple M1 MacBook Air*  
-*Status: Phase 4 Complete, Full-Scale Experiments Ready*
+*Status: Phase 2.5 Complete, KG Walker Optimized & Guarded Reranker Locked*
