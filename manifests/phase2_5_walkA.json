@@ -1,0 +1,30 @@
+{
+  "base": "manifests/phase3_base_v6r2.json",
+  "phase2_5": {
+    "walker_script": "scripts/phase3/kg_walker.py",
+    "params": {
+      "beam": 100, "max_hops": 4, "hop_penalty": 0.8,
+      "allowlist_k": 16, "type_fit_penalty": 0.50, "type_min_compat": 3
+    },
+    "priors": {
+      "entity_types": "data/phase2/type/entity_types.json",
+      "rel_type_prior": "data/phase2/type/rel_type_prior.json"
+    },
+    "inputs": {
+      "graph_triples": "data/phase2/kg_subset_triples_expanded_v2.jsonl",
+      "relation_txt": "data/raw/kg/wikidata5m/wikidata5m_relation.txt",
+      "dataset_in": "data/phase3/annotated_12k_to_walk_phase2_5.jsonl"
+    },
+    "outputs": {
+      "walked": "data/phase3/annotated_12k_walked_phase2_5.jsonl",
+      "fused_reused_lr": "data/phase3/annotated_12k_fused_phase2_5.jsonl",
+      "fused_trained_lr": "data/phase3/annotated_12k_fused_phase2_5_trained.jsonl",
+      "digests": {
+        "walked_sha256": "a7b3260d8dc27be16c9925912e9e2fd22b56e8e82a09c2affb52bf88d0968c9c",
+        "fused_reused_lr_sha256": "669e2b18b86528a0d69166e6815707077dd497104352124b92a50a3223708ad6",
+        "fused_trained_lr_sha256": "74838db58d7f73b8ccbff0fdd3f530122a86d3e4ca54660542b0601cfaf4265d"
+      }
+    },
+    "git": { "commit": "8f70aa690d1e808500ce2d96f3b9df4a20d275db", "branch": "Phase_2.5" }
+  }
+}

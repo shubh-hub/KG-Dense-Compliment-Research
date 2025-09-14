@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-import json, argparse, re
+import json, argparse, re, os
+import numpy as np
 from collections import defaultdict, Counter, deque
 from pathlib import Path
 from tqdm import tqdm
 
-def load_graph(triples_jsonl):
-    adj = defaultdict(list)   # h -> [(r,t)]
+def load_graph(triples_jsonl, smoothing_lambda=0.0):
+    adj = defaultdict(list)
     rel_freq = Counter()
     with open(triples_jsonl, encoding="utf-8-sig") as f:
         for ln in f:
@@ -15,11 +16,13 @@ def load_graph(triples_jsonl):
             except json.JSONDecodeError:
                 continue
             h, r, t = o["head"], o["relation"], o["tail"]
-            adj[h].append((r,t))
-            rel_freq[r]+=1
-    # normalize rel priors
+            adj[h].append((r, t))
+            rel_freq[r] += 1
+
+    # Smoothed relative frequency
     tot = sum(rel_freq.values()) or 1
-    rel_prior = {r:(c/tot) for r,c in rel_freq.items()}
+    num_rels = len(rel_freq) or 1
+    rel_prior = {r: (1 - smoothing_lambda) * (c / tot) + smoothing_lambda * (1 / num_rels) for r, c in rel_freq.items()}
     return adj, rel_prior
 
 def load_relation_map(relation_txt_path):
@@ -32,7 +35,8 @@ def load_relation_map(relation_txt_path):
     return rel_map
 
 def rel_allowlist(question, rel_map, k):
-    toks = set(re.sub(r"[^a-z0-9 ]+", " ", question.lower()).split())
+    STOP = {"of","in","the","a","an","and","or","to","for","on","by","with","at","from","as"}
+    toks = set(w for w in re.sub(r"[^a-z0-9 ]+"," ",question.lower()).split() if w not in STOP)
     allow = []
     for r, lab in rel_map.items():
         lab_toks = set(lab.lower().split())
@@ -40,18 +44,21 @@ def rel_allowlist(question, rel_map, k):
             allow.append(r)
     return set(allow[:k])
 
-def seeds_from_el(sample, adj, min_score=2.0, max_seeds=8, text_seed_topk=10):
+def seeds_from_el(sample, adj, min_score=2.0, max_seeds=6, text_seed_topk=5):
     order = []
-    # (A) Always try gold motif first (may or may not be in adj; let walker decide)
+    # (A) Gold motif head for KG-QA samples
     if sample.get("source") == "kg-qa-generated":
         m = sample.get("motif", [])
-        if m and m[0]: order.append(m[0])
-    # (B) High-confidence EL seeds that exist in our KG subset
-    for m in sample.get("el_metadata", []):
+        if m and m[0] in adj: order.append(m[0])
+
+    # (B) High-confidence, sorted EL seeds
+    el_seeds = sorted([m for m in sample.get("el_metadata", []) if m.get("score", 0) >= min_score], key=lambda x: x.get("score", 0), reverse=True)
+    for m in el_seeds:
         q = m.get("qid")
-        if q and q != "NIL" and m.get("score", 0) >= min_score and q in adj:
+        if q and q != "NIL" and q in adj:
             order.append(q)
-    # (C) Use top-K text candidates as seeds (prefer ones in KG to avoid dead starts)
+
+    # (C) Top-K text candidates as seeds
     for c in (sample.get("text_candidates") or [])[:text_seed_topk]:
         q = c.get("qid")
         if q and q in adj:
@@ -63,32 +70,51 @@ def seeds_from_el(sample, adj, min_score=2.0, max_seeds=8, text_seed_topk=10):
             seen.add(q); seeds.append(q)
     return seeds[:max_seeds]
 
-def walk(adj, rel_prior, seeds, allowlist, max_hops=3, beam=20, hop_penalty=0.8):
-    # beam over frontier: (score, node, path) where path=[(r,next)]
-    # start score = 1.0 per seed
-    candidates = defaultdict(lambda: (-1.0, 10**9))  # node -> (best_score, min_hop)
-    # Initialize candidates with seeds at hop 0
+def walk(adj, rel_prior, seeds, allowlist, max_hops, beam, hop_penalty, entity_types, rel_type_priors, type_fit_penalty, type_min_compat, kge_model, kge_beta):
+    # beam over frontier: (log_score, node, path) where path=[(r,next)]
+    candidates = defaultdict(lambda: (-1e9, 10**9))  # node -> (best_log_score, min_hop)
     for s in seeds:
-        candidates[s] = (1.0, 0)
+        candidates[s] = (0.0, 0) # log(1.0) = 0
 
-    frontier = [(1.0, s, []) for s in seeds]
+    frontier = [(0.0, s, []) for s in seeds]
 
     for hop in range(1, max_hops + 1):
         new_frontier = []
         if not frontier: break
         for score, curr, path in frontier:
             if curr not in adj: continue
-            for r, t in adj[curr]:
-                # relation filtering
-                if allowlist and r not in allowlist: continue
-                # update score
-                pri = rel_prior.get(r, 1.0)
-                sc = score * (hop_penalty ** hop) * pri
-                best_sc, _ = candidates[t]
-                if sc > best_sc:
+
+            edges = [(r, t) for (r, t) in adj.get(curr, []) if (not allowlist or r in allowlist)]
+
+            def is_compatible(r, t):
+                prior_tail = rel_type_priors.get(r, {}).get('tail_types', {})
+                ttypes = entity_types.get(t, [])
+                if not prior_tail or not ttypes: return True
+                return bool(set(ttypes) & set(prior_tail.keys()))
+
+            compat_mask = [is_compatible(r, t) for (r, t) in edges]
+            use_types = sum(compat_mask) >= type_min_compat
+
+            for i, (r, t) in enumerate(edges):
+                new_log_score = log_score + np.log(hop_penalty) + np.log(rel_prior.get(r, 1e-9))
+
+                type_fit = 1.0 if (not use_types or compat_mask[i]) else type_fit_penalty
+                new_log_score += np.log(type_fit)
+
+                if kge_beta > 0 and kge_model:
+                    try:
+                        h_idx, r_idx, t_idx = kge_model['e_map'][curr], kge_model['r_map'][r], kge_model['e_map'][t]
+                        h_vec, r_vec, t_vec = kge_model['e_emb'][h_idx], kge_model['r_emb'][r_idx], kge_model['e_emb'][t_idx]
+                        kge_score = -np.linalg.norm(h_vec + r_vec - t_vec, ord=1) # L1 norm for TransE
+                        new_log_score += kge_beta * kge_score
+                    except KeyError:
+                        pass # Entity or relation not in KGE model
+
+                best_log_sc, _ = candidates[t]
+                if new_log_score > best_log_sc:
                     _, best_h = candidates[t]
-                    candidates[t] = (sc, min(best_h, hop))
-                    new_frontier.append((sc, t, path + [(r, t)]))
+                    candidates[t] = (new_log_score, min(best_h, hop))
+                    new_frontier.append((new_log_score, t, path + [(r, t)]))
         # beam search after expanding all nodes at this hop
         new_frontier.sort(key=lambda x: x[0], reverse=True)
         frontier = new_frontier[:beam]
@@ -108,13 +134,35 @@ def main():
     ap.add_argument("--hop_penalty", type=float, default=0.8)
     ap.add_argument("--topk", type=int, default=20)
     ap.add_argument("--allowlist_k", type=int, default=8, help="Size of relation allowlist")
+    ap.add_argument("--type_fit_penalty", type=float, default=1.0)
+    ap.add_argument("--type_min_compat", type=int, default=3, help="Require at least this many type-compatible edges to enable type penalty at a node.")
+    ap.add_argument("--rel_prior_smooth", type=float, default=0.0, help="Lambda for relation prior smoothing.")
+    ap.add_argument("--kge_model_path", type=str, default=None, help="Path to KGE model artifacts (npz file).")
+    ap.add_argument("--kge_beta", type=float, default=0.0, help="Weight for the KGE prior.")
     ap.add_argument("--expect_min_total", type=int, default=0, help="Fail if total output rows < this number (catches truncated inputs).")
     ap.add_argument("--expect_min_gold", type=int, default=0, help="Fail if gold rows < this number.")
     ap.add_argument("--min_gold_kg_cov", type=float, default=0.60, help="Fail if gold rows with kg_candidates < this fraction.")
     args = ap.parse_args()
 
-    adj, rel_prior = load_graph(args.graph_triples)
+    adj, rel_prior = load_graph(args.graph_triples, smoothing_lambda=args.rel_prior_smooth)
     rel_map = load_relation_map(args.relation_txt)
+
+    print("Loading type priors...")
+    with open('data/phase2/type/entity_types.json', 'r', encoding='utf-8') as f:
+        entity_types = json.load(f)
+    with open('data/phase2/type/rel_type_prior.json', 'r', encoding='utf-8') as f:
+        rel_type_priors = json.load(f)
+
+    kge_model = None
+    if args.kge_model_path and os.path.exists(args.kge_model_path):
+        print(f"Loading KGE model from {args.kge_model_path}...")
+        kge_artifacts = np.load(args.kge_model_path, allow_pickle=True)
+        kge_model = {
+            'e_map': kge_artifacts['e_map'].item(),
+            'r_map': kge_artifacts['r_map'].item(),
+            'e_emb': kge_artifacts['e_emb'],
+            'r_emb': kge_artifacts['r_emb'],
+        }
     with open(args.in_jsonl, 'r', encoding='utf-8-sig') as f_in:
         total_lines = sum(1 for _ in f_in)
         f_in.seek(0)
@@ -143,16 +191,31 @@ def main():
             should_walk = needs_walking and not has_existing_kg_cands
             if should_walk:
                 seeds = seeds_from_el(s, adj)
-                question_text = s.get("text") or s.get("question", "")
+                question_text = s.get("question") or s.get("text") or ""
                 allow = rel_allowlist(question_text, rel_map, args.allowlist_k)
-                # If allowlist is too small, disable it (avoid over-filtering)
+
+                seed_outgoing = set()
+                for q in seeds:
+                    for (r, _) in adj.get(q, []):
+                        seed_outgoing.add(r)
+
+                allowlist_enabled = True
+                if allow and not (allow & seed_outgoing):
+                    allow = None
+                    allowlist_enabled = False
+                
                 if not allow or len(allow) < 2:
                     allow = None
-                cand = walk(adj, rel_prior, seeds, allow, args.max_hops, args.beam, args.hop_penalty) if seeds else {}
+                    allowlist_enabled = False
+
+                s['seeds'] = seeds
+                s['allowlist_meta'] = {'enabled': allowlist_enabled, 'size': len(allow) if allow else 0}
+
+                cand = walk(adj, rel_prior, seeds, allow, args.max_hops, args.beam, args.hop_penalty, entity_types, rel_type_priors, args.type_fit_penalty, args.type_min_compat, kge_model, args.kge_beta) if seeds else {}
                 top = sorted(cand.items(), key=lambda x: x[1]["score"], reverse=True)[:args.topk]
                 s["kg_candidates"] = [{"qid": q, "score": v["score"], "hop": v["hop"]} for q,v in top]
             else:
-                s.setdefault("kg_candidates", [])  # do NOT overwrite to []
+                s.setdefault("kg_candidates", [])
             f_out.write(json.dumps(s, ensure_ascii=False)+"\n")
     print(f"KG walker done → {args.out_jsonl}")
 

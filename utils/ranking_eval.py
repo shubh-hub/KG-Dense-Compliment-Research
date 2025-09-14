@@ -1,6 +1,6 @@
 import json, numpy as np
-DATA="data/phase3/annotated_12k_walked_final_v6_textfix_r2.jsonl"
-FUSED="data/phase3/annotated_12k_fused_lr5bin_v6_textfix_r2_final.jsonl"
+DATA="data/phase3/annotated_12k_walked_b200_h4.jsonl"
+FUSED="data/phase3/annotated_12k_fused_b200_h4.jsonl"
 
 def mrr_at_k(ids, lists, golds, k=20):
     mrr=0; n=0

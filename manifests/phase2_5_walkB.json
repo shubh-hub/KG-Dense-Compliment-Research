@@ -1,0 +1,27 @@
+{
+  "base": "manifests/phase3_base_v6r2.json",
+  "phase2_5b": {
+    "description": "Final run after telemetry analysis and parameter tuning. Best configuration from grid search.",
+    "walker_script": "scripts/phase3/kg_walker.py",
+    "params": {
+      "beam": 200, "max_hops": 4, "hop_penalty": 0.8,
+      "allowlist_k": 16, "type_fit_penalty": 1.0, "rel_prior_smooth": 0.0
+    },
+    "inputs": {
+      "dataset_in": "data/phase3/annotated_12k_to_walk_phase2_5.jsonl"
+    },
+    "outputs": {
+      "walked": "data/phase3/annotated_12k_walked_b200_h4.jsonl",
+      "fused": "data/phase3/annotated_12k_fused_b200_h4.jsonl",
+      "digests": {
+        "walked_sha256": "f7f512f12d91c7c3c56978eea968e39c904b8912b5c7bd61d69bde2340b4a4a9",
+        "fused_sha256": "83742e6eb025a2602e24a2511a61422972a35db14ae9b0371321378fa95ce6ad"
+      }
+    },
+    "git": { "commit": "8f70aa690d1e808500ce2d96f3b9df4a20d275db", "branch": "Phase_2.5" },
+    "repro_commands": {
+      "walk": "conda run -n kg-dense python scripts/phase3/kg_walker.py --in_jsonl data/phase3/annotated_12k_to_walk_phase2_5.jsonl --out_jsonl data/phase3/annotated_12k_walked_b200_h4.jsonl --beam 200 --max_hops 4 --hop_penalty 0.8 --allowlist_k 16 --type_fit_penalty 1.0 --rel_prior_smooth 0.0",
+      "fuse": "conda run -n kg-dense python scripts/phase3/train_and_rerank.py --in_jsonl data/phase3/annotated_12k_walked_b200_h4.jsonl --out_jsonl data/phase3/annotated_12k_fused_b200_h4.jsonl --load_model_pkl data/phase3/lr5bin_v6_textfix_r2.pkl --train_frac 0"
+    }
+  }
+}
