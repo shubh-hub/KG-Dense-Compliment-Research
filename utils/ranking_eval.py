@@ -1,6 +1,4 @@
 import json, numpy as np
-DATA="data/phase3/annotated_12k_walked_b200_h4.jsonl"
-FUSED="data/phase3/annotated_12k_fused_b200_h4.jsonl"
 
 def mrr_at_k(ids, lists, golds, k=20):
     mrr=0; n=0
@@ -18,15 +16,27 @@ def ndcg_at_k(ids, lists, golds, k=20):
         except ValueError: pass
     return nd/max(1,n)
 
-fused_map={}
-for ln in open(FUSED,encoding="utf-8-sig"):
-    s=json.loads(ln); fused_map[s["id"]]=[c["qid"] for c in (s.get("fused_candidates") or [])]
-ids=[]; golds={}; kg_map={}
-for ln in open(DATA,encoding="utf-8-sig"):
-    s=json.loads(ln)
-    if s.get("source")!="kg-qa-generated": continue
-    ids.append(s["id"]); golds[s["id"]]=(s.get("motif",[None]*5)[-1])
-    kg_map[s["id"]]=[c["qid"] for c in (s.get("kg_candidates") or [])]
+def main(args):
+    fused_map={}
+    for ln in open(args.fused,encoding="utf-8-sig"):
+        s=json.loads(ln); fused_map[s["id"]]=[c["qid"] for c in (s.get("fused_candidates") or [])]
+    ids=[]; golds={}; kg_map={}
+    for ln in open(args.walked,encoding="utf-8-sig"):
+        s=json.loads(ln)
+        if s.get("source")!="kg-qa-generated": continue
+        ids.append(s["id"]); golds[s["id"]]=(s.get("motif",[None]*5)[-1])
+        kg_map[s["id"]]=[c["qid"] for c in (s.get("kg_candidates") or [])]
 
-print("MRR@20 fused:", mrr_at_k(ids,fused_map,golds), "kg:", mrr_at_k(ids,kg_map,golds))
-print("NDCG@20 fused:", ndcg_at_k(ids,fused_map,golds), "kg:", ndcg_at_k(ids,kg_map,golds))
+    print("--- Ranking Metrics ---")
+    print(f"| Metric  | Fused     | KG        |")
+    print(f"|---------|-----------|-----------|")
+    print(f"| MRR@20  | {mrr_at_k(ids,fused_map,golds):.5f}   | {mrr_at_k(ids,kg_map,golds):.5f}   |")
+    print(f"| NDCG@20 | {ndcg_at_k(ids,fused_map,golds):.5f}   | {ndcg_at_k(ids,kg_map,golds):.5f}   |")
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate ranking metrics.')
+    parser.add_argument('--walked', type=str, required=True, help='Path to the walked JSONL file.')
+    parser.add_argument('--fused', type=str, required=True, help='Path to the fused JSONL file.')
+    args = parser.parse_args()
+    main(args)

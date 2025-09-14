@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import json, argparse, re, os
 import numpy as np
-from collections import defaultdict, Counter, deque
-from pathlib import Path
+from collections import defaultdict, Counter
 from tqdm import tqdm
 
 def load_graph(triples_jsonl, smoothing_lambda=0.0):
@@ -25,6 +24,41 @@ def load_graph(triples_jsonl, smoothing_lambda=0.0):
     rel_prior = {r: (1 - smoothing_lambda) * (c / tot) + smoothing_lambda * (1 / num_rels) for r, c in rel_freq.items()}
     return adj, rel_prior
 
+def build_per_seed_structural_allowlist(sample, adj, rel_prior, k=16):
+    """Union of top-k relations from each seed, weighted by global frequency."""
+    seeds = sample.get("seeds", [])
+    all_rels = set()
+    for s in seeds:
+        if s not in adj: continue
+        # Weight outgoing relations by their global prior and take top-k
+        rels = sorted(adj[s], key=lambda x: rel_prior.get(x[0], 0), reverse=True)
+        all_rels.update(r for r, t in rels[:k])
+    return all_rels
+
+def build_question_allowlist(question, rel_map, k):
+    SYNONYMS = {
+        "alma mater": "educated at", "wife": "spouse", "husband": "spouse",
+        "born in": "place of birth", "died in": "place of death", "capital": "capital",
+        "member of": "member of", "parent company": "parent organization", "owner": "parent organization",
+        "subsidiary": "subsidiary", "wrote": "author", "author": "author",
+        "directed by": "director", "starring": "cast member", "cast": "cast member"
+    }
+    STOP = {"of","in","the","a","an","and","or","to","for","on","by","with","at","from","as"}
+    
+    q_lower = (question or "").lower()
+    # Expand with synonyms
+    for syn, expansion in SYNONYMS.items():
+        if syn in q_lower:
+            q_lower += " " + expansion
+
+    qtok = set(w for w in re.sub(r"[^a-z0-9 ]+"," ",q_lower).split() if w not in STOP)
+    allow = []
+    for r, lab in rel_map.items():
+        lab_toks = set(lab.lower().split())
+        if qtok & lab_toks:
+            allow.append(r)
+    return set(allow[:k])
+
 def load_relation_map(relation_txt_path):
     rel_map = {}
     with open(relation_txt_path, encoding="utf-8") as f:
@@ -34,15 +68,6 @@ def load_relation_map(relation_txt_path):
                 rel_map[parts[0]] = parts[1]
     return rel_map
 
-def rel_allowlist(question, rel_map, k):
-    STOP = {"of","in","the","a","an","and","or","to","for","on","by","with","at","from","as"}
-    toks = set(w for w in re.sub(r"[^a-z0-9 ]+"," ",question.lower()).split() if w not in STOP)
-    allow = []
-    for r, lab in rel_map.items():
-        lab_toks = set(lab.lower().split())
-        if toks & lab_toks:
-            allow.append(r)
-    return set(allow[:k])
 
 def seeds_from_el(sample, adj, min_score=2.0, max_seeds=6, text_seed_topk=5):
     order = []
@@ -75,8 +100,17 @@ def walk(adj, rel_prior, seeds, allowlist, max_hops, beam, hop_penalty, entity_t
     candidates = defaultdict(lambda: (-1e9, 10**9))  # node -> (best_log_score, min_hop)
     for s in seeds:
         candidates[s] = (0.0, 0) # log(1.0) = 0
-
     frontier = [(0.0, s, []) for s in seeds]
+    # Precompute logs once
+    if not (0.0 < hop_penalty <= 1.0):
+        raise ValueError(f"hop_penalty must be in (0,1], got {hop_penalty}")
+    if not (0.0 < type_fit_penalty <= 1.0):
+        raise ValueError(f"type_fit_penalty must be in (0,1], got {type_fit_penalty}")
+    log_hp = np.log(hop_penalty)
+    log_pen = np.log(type_fit_penalty)
+    # Log priors for speed & stability
+    LOG_EPS = 1e-12
+    log_rel_prior = {r: np.log(max(p, LOG_EPS)) for r, p in rel_prior.items()}
 
     for hop in range(1, max_hops + 1):
         new_frontier = []
@@ -85,6 +119,8 @@ def walk(adj, rel_prior, seeds, allowlist, max_hops, beam, hop_penalty, entity_t
             if curr not in adj: continue
 
             edges = [(r, t) for (r, t) in adj.get(curr, []) if (not allowlist or r in allowlist)]
+            # Deterministic & informed expansion
+            edges.sort(key=lambda rt: rel_prior.get(rt[0], 0.0), reverse=True)
 
             def is_compatible(r, t):
                 prior_tail = rel_type_priors.get(r, {}).get('tail_types', {})
@@ -96,10 +132,11 @@ def walk(adj, rel_prior, seeds, allowlist, max_hops, beam, hop_penalty, entity_t
             use_types = sum(compat_mask) >= type_min_compat
 
             for i, (r, t) in enumerate(edges):
-                new_log_score = log_score + np.log(hop_penalty) + np.log(rel_prior.get(r, 1e-9))
+                new_log_score = score + log_hp + log_rel_prior.get(r, np.log(LOG_EPS))
 
                 type_fit = 1.0 if (not use_types or compat_mask[i]) else type_fit_penalty
-                new_log_score += np.log(type_fit)
+                if type_fit != 1.0:
+                    new_log_score += log_pen
 
                 if kge_beta > 0 and kge_model:
                     try:
@@ -133,7 +170,9 @@ def main():
     ap.add_argument("--beam", type=int, default=20)
     ap.add_argument("--hop_penalty", type=float, default=0.8)
     ap.add_argument("--topk", type=int, default=20)
-    ap.add_argument("--allowlist_k", type=int, default=8, help="Size of relation allowlist")
+    ap.add_argument("--allowlist_k", type=int, default=16, help="Size of question-token allowlist")
+    ap.add_argument("--struct_allow_k_per_seed", type=int, default=2, help="Per-seed top-K structural relations to union")
+    ap.add_argument("--allowlist_cap", type=int, default=64, help="Cap on |question ∪ structural| allowlist size")
     ap.add_argument("--type_fit_penalty", type=float, default=1.0)
     ap.add_argument("--type_min_compat", type=int, default=3, help="Require at least this many type-compatible edges to enable type penalty at a node.")
     ap.add_argument("--rel_prior_smooth", type=float, default=0.0, help="Lambda for relation prior smoothing.")
@@ -142,6 +181,7 @@ def main():
     ap.add_argument("--expect_min_total", type=int, default=0, help="Fail if total output rows < this number (catches truncated inputs).")
     ap.add_argument("--expect_min_gold", type=int, default=0, help="Fail if gold rows < this number.")
     ap.add_argument("--min_gold_kg_cov", type=float, default=0.60, help="Fail if gold rows with kg_candidates < this fraction.")
+    ap.add_argument("--text_seed_topk", type=int, default=5, help="Number of text candidates to consider for seeds.")
     args = ap.parse_args()
 
     adj, rel_prior = load_graph(args.graph_triples, smoothing_lambda=args.rel_prior_smooth)
@@ -190,26 +230,32 @@ def main():
 
             should_walk = needs_walking and not has_existing_kg_cands
             if should_walk:
-                seeds = seeds_from_el(s, adj)
+                seeds = seeds_from_el(s, adj, text_seed_topk=args.text_seed_topk)
                 question_text = s.get("question") or s.get("text") or ""
-                allow = rel_allowlist(question_text, rel_map, args.allowlist_k)
-
-                seed_outgoing = set()
-                for q in seeds:
-                    for (r, _) in adj.get(q, []):
-                        seed_outgoing.add(r)
-
-                allowlist_enabled = True
-                if allow and not (allow & seed_outgoing):
+                s['seeds'] = seeds  # must be set before structural allowlist
+                q_allow = build_question_allowlist(question_text, rel_map, args.allowlist_k)
+                s_allow = build_per_seed_structural_allowlist(s, adj, rel_prior, k=args.struct_allow_k_per_seed)
+                allow_union = (q_allow | s_allow)
+                # Cap allowlist to keep precision if it grows large
+                if allow_union:
+                    pre_size = len(allow_union)
+                    allow = set(sorted(allow_union, key=lambda r: rel_prior.get(r, 0.0), reverse=True)[:args.allowlist_cap])
+                else:
+                    pre_size = 0
                     allow = None
-                    allowlist_enabled = False
-                
-                if not allow or len(allow) < 2:
-                    allow = None
-                    allowlist_enabled = False
 
-                s['seeds'] = seeds
-                s['allowlist_meta'] = {'enabled': allowlist_enabled, 'size': len(allow) if allow else 0}
+                # Telemetry: composition
+                q_only = len(q_allow - s_allow)
+                s_only = len(s_allow - q_allow)
+                both   = len(q_allow & s_allow)
+                s["allowlist_meta"] = {
+                    "enabled": bool(allow),
+                    "size": len(allow) if allow else 0,
+                    "pre_cap_size": pre_size,
+                    "q_allow_size": len(q_allow),
+                    "s_allow_size": len(s_allow),
+                    "q_only": q_only, "s_only": s_only, "both": both,
+                }
 
                 cand = walk(adj, rel_prior, seeds, allow, args.max_hops, args.beam, args.hop_penalty, entity_types, rel_type_priors, args.type_fit_penalty, args.type_min_compat, kge_model, args.kge_beta) if seeds else {}
                 top = sorted(cand.items(), key=lambda x: x[1]["score"], reverse=True)[:args.topk]

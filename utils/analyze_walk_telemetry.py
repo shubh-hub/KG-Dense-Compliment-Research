@@ -7,7 +7,8 @@ from collections import Counter
 def analyze_walk(file_path):
     hits_by_hop = Counter()
     seeds_vs_success = {'hit': [], 'miss': []}
-    allowlist_usage = {'enabled': 0, 'disabled': 0, 'enabled_hit': 0, 'disabled_hit': 0}
+    allowlist_usage = {'enabled': 0, 'disabled': 0, 'enabled_hit': 0, 'disabled_hit': 0, 'q_only_event': 0, 's_only_event': 0, 'both_event': 0}
+    allowlist_sizes = {'pre_cap': [], 'post_cap': []}
     total_samples = 0
 
     with open(file_path, 'r', encoding='utf-8-sig') as f:
@@ -26,10 +27,22 @@ def analyze_walk(file_path):
             seeds_vs_success['hit' if is_hit else 'miss'].append(num_seeds)
 
             # 2. Allowlist Usage
-            allowlist_enabled = s.get('allowlist_meta', {}).get('enabled', False)
+            meta = s.get('allowlist_meta', {})
+            allowlist_enabled = meta.get('enabled', False)
             if allowlist_enabled:
                 allowlist_usage['enabled'] += 1
                 if is_hit: allowlist_usage['enabled_hit'] += 1
+                
+                allowlist_sizes['pre_cap'].append(meta.get('pre_cap_size', 0))
+                allowlist_sizes['post_cap'].append(meta.get('size', 0))
+
+                # Use the pre-computed composition fields
+                if meta.get('q_only', 0) > 0 and meta.get('s_only', 0) == 0 and meta.get('both', 0) == 0:
+                    allowlist_usage['q_only_event'] += 1
+                elif meta.get('s_only', 0) > 0 and meta.get('q_only', 0) == 0 and meta.get('both', 0) == 0:
+                    allowlist_usage['s_only_event'] += 1
+                elif meta.get('both', 0) > 0:
+                    allowlist_usage['both_event'] += 1
             else:
                 allowlist_usage['disabled'] += 1
                 if is_hit: allowlist_usage['disabled_hit'] += 1
@@ -43,6 +56,9 @@ def analyze_walk(file_path):
 
     print("--- Walk Telemetry Analysis ---")
     print(f"Analyzed {total_samples} samples from {file_path}\n")
+    if total_samples == 0:
+        print("[WARN] No 'kg-qa-generated' samples found. No further analysis to report.")
+        return
 
     # Print Seeds vs. Success
     avg_seeds_hit = np.mean(seeds_vs_success['hit']) if seeds_vs_success['hit'] else 0
@@ -58,7 +74,15 @@ def analyze_walk(file_path):
     print("[Allowlist Usage]")
     print(f"  - % Queries with Allowlist Enabled: {enabled_rate:.2%}")
     print(f"  - Hit Rate with Allowlist: {enabled_hit_rate:.2%}")
-    print(f"  - Hit Rate without Allowlist (safety valve): {disabled_hit_rate:.2%}\n")
+    print(f"  - Hit Rate without Allowlist: {disabled_hit_rate:.2%}")
+    avg_pre_cap = np.mean(allowlist_sizes['pre_cap']) if allowlist_sizes['pre_cap'] else 0
+    avg_post_cap = np.mean(allowlist_sizes['post_cap']) if allowlist_sizes['post_cap'] else 0
+    print(f"  - Avg Allowlist Size: {avg_post_cap:.1f} (pre-cap: {avg_pre_cap:.1f})")
+
+    q_event_rate = allowlist_usage['q_only_event'] / allowlist_usage['enabled'] if allowlist_usage['enabled'] > 0 else 0
+    s_event_rate = allowlist_usage['s_only_event'] / allowlist_usage['enabled'] if allowlist_usage['enabled'] > 0 else 0
+    both_event_rate = allowlist_usage['both_event'] / allowlist_usage['enabled'] if allowlist_usage['enabled'] > 0 else 0
+    print(f"  - Composition: Q-only={q_event_rate:.2%}, S-only={s_event_rate:.2%}, Both={both_event_rate:.2%}\n")
 
     # Print Hits by Hop
     total_hits = sum(hits_by_hop.values())

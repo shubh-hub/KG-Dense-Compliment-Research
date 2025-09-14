@@ -1,0 +1,39 @@
+{
+  "base": "manifests/phase3_base_v6r2.json",
+  "phase2_5": {
+    "walker_script": "scripts/phase3/kg_walker.py",
+    "params": {
+      "beam": 200,
+      "max_hops": 4,
+      "hop_penalty": 0.8,
+      "allowlist_k": 16,
+      "struct_allow_k_per_seed": 2,
+      "allowlist_cap": 64,
+      "type_fit_penalty": 1.0,
+      "text_seed_topk": 5
+    },
+    "priors": {
+      "entity_types": "data/phase2/type/entity_types.json",
+      "rel_type_prior": "data/phase2/type/rel_type_prior.json"
+    },
+    "inputs": {
+      "graph_triples": "data/phase2/kg_subset_triples_expanded_v2.jsonl",
+      "relation_txt": "data/raw/kg/wikidata5m/wikidata5m_relation.txt",
+      "dataset_in": "data/phase3/annotated_12k_to_walk_phase2_5.jsonl"
+    },
+    "outputs": {
+      "walked": {
+        "path": "data/phase3/annotated_12k_walked_fallback_k16_b200_h4.jsonl",
+        "sha256": "3a4738bf73f98993356a118400e46ed1e39b0e4fd78aa2812c12d6a9d32a2422"
+      },
+      "fused_reused_lr": {
+        "path": "data/phase3/annotated_12k_fused_fallback_reused.jsonl",
+        "sha256": "45b22e1eef25422efb7121be46dab2033fc41b4e0752c970fd3971334229929c"
+      },
+      "fused_trained_lr": {
+        "path": "data/phase3/annotated_12k_fused_fallback_trained.jsonl",
+        "sha256": "61df19cbb5be97717d846775d919fc668cf3c8d5a844c9315b69252f56dc4bb0"
+      }
+    }
+  }
+}

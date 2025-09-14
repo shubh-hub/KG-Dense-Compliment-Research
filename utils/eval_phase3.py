@@ -5,8 +5,6 @@ from math import comb
 from collections import Counter
 
 # --- Constants ---
-DATA_PATH = "data/phase3/annotated_12k_walked_b200_h4.jsonl"
-FUSED_PATH = "data/phase3/annotated_12k_fused_b200_h4.jsonl"
 K = 20
 N_BOOTSTRAP = 1000
 N_RANDOMIZATION = 10000
@@ -70,7 +68,7 @@ def approx_randomization_test(samples, n_trials=N_RANDOMIZATION):
 
 # --- Main Evaluation Logic ---
 def main(args):
-    samples = load_data(DATA_PATH, FUSED_PATH)
+    samples = load_data(args.walked, args.fused)
     
     # Pre-calculate correctness and scores for each sample
     for s in samples:
@@ -127,6 +125,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Comprehensive evaluation harness for Phase 3.')
+    parser.add_argument('--walked', type=str, required=True, help='Path to the walked JSONL file.')
+    parser.add_argument('--fused', type=str, required=True, help='Path to the fused JSONL file.')
     parser.add_argument('--json_out', type=str, help='Path to save the output JSON file.')
     args = parser.parse_args()
     main(args)
