@@ -680,3 +680,145 @@ Yep — here’s the Phase-3 board with what’s **already running** vs **still 
 That’s the current map. If you want, I can drop the exact code hooks/flags for (a) injecting type priors into the walker score and (b) reading TransE embeddings to compute a fast Δscore per hop.
 
 Date - Sat 13 Sep 6:04AM
+
+Absolutely—here’s a tight, step-by-step queue that picks up **exactly** from your current Phase-3 baseline (v6\_textfix\_r2 locked) and moves through **Phase 2.5** before returning to Phase-3 fusion.
+
+# Step 0 — Lock & book-keeping (you mostly did this)
+
+1. **Commit the manifest + tag**
+
+```bash
+git add manifests/phase3_base_v6r2.json manifests/README.md utils/*.py
+git commit -m "Lock Phase-3 base v6_textfix_r2 + eval scripts"
+git tag -a phase3_base_v6r2 -m "Phase 3 base (v6_textfix_r2)"
+```
+
+2. **Freeze env**
+
+```bash
+conda env export -n kg-dense > envs/phase3_base_v6r2.yml
+```
+
+3. **Persist metrics**
+   Write a JSON alongside the README (same numbers you printed) so future runs can diff.
+
+```bash
+python utils/eval_phase3.py --json_out reports/phase3_base_v6r2_metrics.json
+```
+
+# Step 1 — Finish the evaluation harness (one pass)
+
+* Add to `utils/eval_phase3.py`:
+
+  * bootstrap 95% CIs for recall\@20, MRR\@20, NDCG\@20 (1k resamples),
+  * exact CI (you implemented), independence gap (done), McNemar overall + per-slice (done),
+  * emit a single JSON blob (for plots + paper tables).
+* Produce a small HTML/markdown report from that JSON (table + bullets).
+
+> Outcome: reproducible, one-command eval that we’ll reuse after each tweak below.
+
+# Step 2 — **Phase 2.5: Walker upgrades** (type/domain + KGE prior)
+
+These raise **kg\@20** and therefore the **oracle**, which is the real bottleneck.
+
+## 2.1 Type/Domain compatibility (cheap, local)
+
+1. **Build relation→(domain, range)** priors from your subset:
+
+   * From `kg_subset_triples_expanded_v2.jsonl`, collect:
+
+     * direct `P31` (instance-of) types for each entity
+     * for each relation `r`, the top-K head/tail types seen (e.g., K=10) → `rel_type_prior.json`
+2. **Walker change** (`kg_walker.py`):
+
+   * When scoring edge `(curr --r--> t)`, compute
+
+     * `type_fit = 1` if `type(t)` ∈ prior\_range\[r] else `τ` (e.g., `τ=0.4`)
+   * Multiply your hop step by `type_fit`.
+3. **Rewalk gold only**, compute `kg@20`, `oracle@20`. If ↑, rewalk full set.
+
+## 2.2 Lightweight KGE prior (TransE on Colab)
+
+1. **Prep triples TSV** (ids only; no labels):
+
+```bash
+python scripts/phase2/export_triples_for_kge.py \
+  --in data/phase2/kg_subset_triples_expanded_v2.jsonl \
+  --out data/phase2/kge/train.tsv
+```
+
+2. **Colab (PyKEEN or OpenKE)** — minimal TransE:
+
+```python
+from pykeen.pipeline import pipeline
+result = pipeline(
+    model='TransE', training='train.tsv', training_kwargs=dict(create_inverse_triples=True),
+    model_kwargs=dict(embedding_dim=200, scoring_fct_norm=1),
+    optimizer='Adam', optimizer_kwargs=dict(lr=1e-3),
+    training_loop='slcwa', stopper='early', stopper_kwargs=dict(patience=5),
+)
+result.save_to_directory('transE_out')
+```
+
+3. **Export artifacts** back to repo:
+
+```
+data/phase2/kge/transE/{entity_to_id.json, relation_to_id.json, entity_embeddings.npy, relation_embeddings.npy}
+```
+
+4. **Walker integration**:
+
+   * Load embeddings once.
+   * Score each step with TransE: `s_kge = -||e_h + e_r - e_t||₁`
+   * Normalize per-relation (z-score over that r’s targets) or global min-max.
+   * Combine in log-space or multiplicative:
+
+     * `score *= exp(β * s_kge_norm)` with small β (start 0.1\~0.3).
+5. **Rewalk gold**, sweep β∈{0.0, 0.1, 0.2, 0.3}, keep best β, then rewalk full.
+
+> Milestone: show **kg\@20** ↑ and **oracle\@20** ↑ vs v6\_textfix\_r2; re-run full eval JSON.
+
+# Step 3 — Router & reranker refresh (post-2.5)
+
+1. **Router ablations** at budget parity:
+
+   * “text-only”, “kg-only”, “always-both”, “router”.
+   * Log latency + top-k budgets (already in manifest).
+2. **Reranker features++**:
+
+   * Add `kge_best`, `kge_mean`, `type_fit`, `hop`, `rel_prior`, `agree_text_kg` flags.
+   * Try XGBoost (tabular) alongside LR; keep whichever improves **MRR/NDCG** without hurting recall.
+3. **Re-train** on the new walked file, re-emit report JSON.
+
+# Step 4 — Modest text-side recall bump (surgical, parity-safe)
+
+You already proved BM25 entities exist but are ranked low. Two **cheap** upgrades that don’t blow budget:
+
+1. **Alias-augmented queries**: if EL fires, append top aliases of detected QIDs to the BM25 query string (cap to N tokens). Re-run only rows where `text@20` is 0.
+2. **RM3 pseudo-relevance feedback** on top-20 (same budget): build expansion from those 20, re-query, keep top-20.
+
+Merge only when improved; re-compute `text@20`, `oracle@20`, then re-train reranker once.
+
+# Step 5 — Paper-track shaping (in parallel)
+
+* Start a short **Methods** doc:
+
+  * budget-parity protocol, oracle/CI/independence definitions, eval harness,
+  * “negative-to-neutral” finding for CI on this dataset,
+  * Phase 2.5 improvements as **principled retrieval priors** (type/KGE) that raise oracle.
+* Add one **external dataset** slice with stronger text signals (e.g., small NQ-open dev subset) to show cases where CI > 0.
+
+---
+
+## What to run next (in order)
+
+1. **Eval harness JSON & bootstrap CIs** → emit `reports/phase3_base_v6r2_metrics.json`.
+2. **Type/domain prior build** → integrate into walker → rewalk gold → eval.
+3. **TransE train on Colab** → integrate β sweep → rewalk gold → eval → rewalk full if gains.
+4. **Reranker features++ (incl. KGE/type)** → retrain → eval.
+5. **Alias-augmented BM25 + RM3** on remaining bad text rows → merge → retrain → eval.
+6. **Ablations** (router/always-both/text-only/kg-only) → single consolidated table.
+
+If you want, paste the “plan from yesterday” and I’ll align the above 1:1 so we don’t miss anything.
+
+Date - Sat 14 Sep 10:26AM
