@@ -218,7 +218,7 @@ Text@20 **1.5%**, KG@20 **9.6%**, Oracle@20 **10.4%**, Fused@20 **9.9%**, gap‑
 ```bibtex
 @misc{kg-dense-complementarity,
   title        = {KG + Dense Vector Complementarity},
-  author       = {Shivam et al.},
+  author       = {Shubham et al.},
   year         = {2025},
   howpublished = {GitHub repository},
 }
