@@ -15,7 +15,43 @@
 * **Reproducibility**: manifests, checksums, and one‑command eval scripts
 
 ---
+# Hybrid Retrieval with Knowledge Graphs and Dense Vectors under Budget Parity
 
+## 📖 Research Summary
+
+This study investigates the **complementary evidence** captured by knowledge graphs (KG) and dense vector retrieval for document search. We introduce a robust **hybrid pipeline** and a budget-parity evaluation harness. The pipeline involves (i) walking a typed subgraph of **Wikidata5M**, (ii) retrieving text via **BM25/dense vectors**, and (iii) fusing candidates using a learned reranker with an explicit **Monotone Fusion Guard**. This guard is *provably* designed to preserve KG recall ($\text{KG@}k$).
+
+Methodologically, complementarity is operationalized using **oracle bounds**, **gap-closure**, **McNemar tests**, and a **Complementarity Index (CI)**. On a 12k pilot dataset (1k gold items), the guarded fusion significantly improved performance: **MRR@20** rose from $0.017$ (KG) to $0.062$ (Hybrid), and **NDCG@20** from $0.042$ to $0.079$. This achieved a gap-closure of $\approx 18\%$ under equal top-$k$ and latency. Feature inspection revealed interpretable signals, such as a strong positive weight for the feature *in\_kg* and penalties for deep hops. We also designed and calibrated two retrieval priors—a **type/domain compatibility prior** ($\tau$-sweep) and a **KGE prior**—addressing a negative result related to global TransE score normalization via a fix using *per-relation normalization* and *type-gating*. This work provides a reproducible, statistically grounded framework and concrete engineering lessons for building hybrid retrieval systems.
+
+## ✨ Why This Is Interesting
+
+* **Principled Measurement:** The combination of Oracle Gap, Complementarity Index (CI), and paired significance tests (McNemar) transforms the claim "fusion helps" into a **falsifiable and statistically grounded assertion**.
+* **Method–Systems Co-design:** The **Monotone Fusion Guard** enforces a critical retrieval invariant—ensuring no regressions on KG recall—while simultaneously allowing for flexible **learning-to-rank (LTR)**.
+* **Calibrated Priors:** This research provides clear empirical evidence for *when* **Knowledge Graph Embeddings (KGE)** are beneficial (e.g., with type-consistent edges, per-relation scaling) and *when* they are detrimental (e.g., with naive global normalization).
+
+## 📊 Selected Results (Pilot, 1k Gold)
+
+| Metric | KG Only | Hybrid (Guarded) | Oracle Ceiling | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Recall@20** | $13.6\%$ | $13.8\%$ | $14.7\%$ | Guard maintains KG recall; $\approx 18\%$ gap-closure. |
+| **MRR@20** | $0.017$ | $0.062$ | N/A | $\approx 3.6\times$ improvement over KG. |
+| **NDCG@20** | $0.042$ | $0.079$ | N/A | Significant ranking gains (approx. randomization test). |
+
+* **Statistical Validity:** McNemar test showed **no significant regressions** vs KG on gold slice; approx. randomization test confirmed significant ranking gains.
+* **Ablations:** Type prior $\tau \in \{0.3, 0.4, 0.5\}$ stabilized hops (increased $\text{hop}-2$ share). Naive global KGE normalization reduced $\text{KG@}20$ (diagnosed and corrected with per-relation, type-gated KGE).
+
+## 🛠️ Key Contributions (What I Built)
+
+1.  **Budget-Parity Evaluation Harness:** Includes tools for statistical rigor: **oracle bounds, Complementarity Index (CI), McNemar tests**, and **bootstrap confidence intervals (CIs)**.
+2.  **Typed KG Walker:** A sophisticated walker implementing **beam search**, a **hop penalty** function, and strict **allowlists/blocklists**, integrated with a new **type/domain compatibility prior**.
+3.  **Safe KGE Integration:** Implemented a mapping-safe packaging approach (JSON maps + `.npy` files), **per-relation statistics** for score normalization, and safe application via **type-gating** and **clamping** (bounded influence).
+4.  **Learned Reranker + Monotone Fusion Guard:** A LTR model complemented by the explicit guard to ensure recall invariants. Includes a robust methodology for **feature-importance inspection** to maintain interpretability.
+
+## 🚀 Future Directions
+
+* **KGE Scoring Swap:** Replace TransE with a model like **RotatE** to better handle temporal or relational-role sensitivities via its relation-phase component.
+* **Budget-Parity Optimization:** Train a lightweight **cross-encoder reranker** that is **router-triggered** (only runs on ambiguous candidate pairs) to improve ranking quality while remaining strictly within the budget-parity constraint.
+* **External Validation:** Extend the evaluation to a second, distinct domain to thoroughly test the external validity and generalizability of the complementarity metrics and hybrid framework.
 ## Repo Status & Roadmap
 
 **Phase 1 (synthetic+infra):** ✅ complete
