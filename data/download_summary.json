@@ -1,0 +1,26 @@
+{
+  "timestamp": "2025-09-06 16:18:54",
+  "datasets": {
+    "natural_questions": {
+      "size_gb": 16.91,
+      "path": "/Users/shivam/Documents/Shubham/Research project/data/raw/qa/natural_questions"
+    },
+    "ms_marco_qa": {
+      "size_gb": 3.99,
+      "path": "/Users/shivam/Documents/Shubham/Research project/data/raw/qa/ms_marco_qa"
+    },
+    "ms_marco_passage": {
+      "size_gb": 0.4,
+      "path": "/Users/shivam/Documents/Shubham/Research project/data/raw/ir/ms_marco_passage"
+    },
+    "beir": {
+      "size_gb": 0.0,
+      "path": "/Users/shivam/Documents/Shubham/Research project/data/raw/ir/beir"
+    },
+    "wikidata5m": {
+      "size_gb": 0.0,
+      "path": "/Users/shivam/Documents/Shubham/Research project/data/raw/kg/wikidata5m"
+    }
+  },
+  "total_size_gb": 21.3
+}
