@@ -36,13 +36,15 @@ def analyze_walk(file_path):
                 allowlist_sizes['pre_cap'].append(meta.get('pre_cap_size', 0))
                 allowlist_sizes['post_cap'].append(meta.get('size', 0))
 
-                # Use the pre-computed composition fields
-                if meta.get('q_only', 0) > 0 and meta.get('s_only', 0) == 0 and meta.get('both', 0) == 0:
-                    allowlist_usage['q_only_event'] += 1
-                elif meta.get('s_only', 0) > 0 and meta.get('q_only', 0) == 0 and meta.get('both', 0) == 0:
-                    allowlist_usage['s_only_event'] += 1
-                elif meta.get('both', 0) > 0:
+                # Use boolean logic on allowlist presence
+                q_present = meta.get('q_allow_size', 0) > 0
+                s_present = meta.get('s_allow_size', 0) > 0
+                if q_present and s_present:
                     allowlist_usage['both_event'] += 1
+                elif q_present:
+                    allowlist_usage['q_only_event'] += 1
+                elif s_present:
+                    allowlist_usage['s_only_event'] += 1
             else:
                 allowlist_usage['disabled'] += 1
                 if is_hit: allowlist_usage['disabled_hit'] += 1
